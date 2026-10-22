@@ -1,0 +1,17 @@
+# Zephyr build directories
+build/
+build_*/
+build-*/
+
+# IDE
+.vscode/
+.idea/
+
+# Object files
+*.o
+*.obj
+*.elf
+*.bin
+
+# Zephyr generated
+zephyr/
