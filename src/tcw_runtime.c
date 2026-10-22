@@ -1,15 +1,6 @@
 #include "tcw_runtime.h"
 #include <string.h>
-
-/* ============================================================
- * TCW-Runtime v0.3
- *
- * v0.3 fix vs v0.2:
- *   tcw_aging() now syncs backup with working after aging.
- *   Rationale (biology): a 40-year-old heals in a 40-year-old body,
- *   not in a 20-year-old one. Without this fix, repair would "youthify"
- *   the agent by restoring pre-aged backup, cancelling aging entirely.
- * ============================================================ */
+#include <math.h>
 
 static uint32_t xorshift32(uint32_t *state) {
     uint32_t x = *state;
@@ -31,6 +22,22 @@ uint32_t tcw_crc32(const uint8_t *data, size_t len) {
     return ~crc;
 }
 
+static inline tcw_mlp_t *phi_mlp(tcw_agent_t *a) {
+    return (tcw_mlp_t *)a->phi.working;
+}
+static inline const tcw_mlp_t *phi_mlp_const(const tcw_agent_t *a) {
+    return (const tcw_mlp_t *)a->phi.working;
+}
+
+float tcw_mlp_forward(const tcw_mlp_t *m, float x) {
+    float y = m->b2;
+    for (int i = 0; i < TCW_MLP_HIDDEN; i++) {
+        float z = tanhf(m->w1[i] * x + m->b1[i]);
+        y += m->w2[i] * z;
+    }
+    return y;
+}
+
 tcw_status_t tcw_init(tcw_agent_t *agent,
                       const uint8_t *genome_data, size_t genome_size,
                       uint16_t max_rank) {
@@ -41,10 +48,9 @@ tcw_status_t tcw_init(tcw_agent_t *agent,
     agent->genome.size  = genome_size;
     agent->genome.crc32 = tcw_crc32(genome_data, genome_size);
 
-    size_t copy_size = genome_size < TCW_PHI_SIZE_BYTES ? genome_size : TCW_PHI_SIZE_BYTES;
+    /* Birth: PHI = zero MLP (y_corr = 0, model used as-is) */
     memset(agent->phi.working, 0, TCW_PHI_SIZE_BYTES);
-    memcpy(agent->phi.working, genome_data, copy_size);
-    memcpy(agent->phi.backup, agent->phi.working, TCW_PHI_SIZE_BYTES);
+    memset(agent->phi.backup,  0, TCW_PHI_SIZE_BYTES);
 
     agent->phi.size     = TCW_PHI_SIZE_BYTES;
     agent->phi.rank     = max_rank;
@@ -54,6 +60,50 @@ tcw_status_t tcw_init(tcw_agent_t *agent,
 
     agent->gate.alpha         = 1.0f;
     agent->gate.mutation_rate = 1e-4f;
+    return TCW_OK;
+}
+
+/* ============================================================
+ * E_topo: metabolism. SGD on PHI, C frozen.
+ * Loss: L = 0.5 * (y_pred - y_target)^2
+ * Grad: dL/dy = (y_pred - y_target)
+ * ============================================================ */
+tcw_status_t tcw_etopo(tcw_agent_t *agent,
+                       const float *x_data, const float *y_target,
+                       size_t n, float lr, int epochs) {
+    if (!agent || !x_data || !y_target || n == 0) return TCW_ERR_INVALID_ARG;
+    if (!agent->phi.alive) return TCW_ERR_DEAD;
+
+    tcw_mlp_t *m = phi_mlp(agent);
+
+    for (int ep = 0; ep < epochs; ep++) {
+        for (size_t i = 0; i < n; i++) {
+            float x  = x_data[i];
+            float yt = y_target[i];
+
+            /* Forward */
+            float z[TCW_MLP_HIDDEN];
+            float y = m->b2;
+            for (int j = 0; j < TCW_MLP_HIDDEN; j++) {
+                z[j] = tanhf(m->w1[j] * x + m->b1[j]);
+                y += m->w2[j] * z[j];
+            }
+
+            /* Backward */
+            float dy = y - yt;
+            for (int j = 0; j < TCW_MLP_HIDDEN; j++) {
+                float dz = dy * m->w2[j] * (1.0f - z[j] * z[j]);
+                m->w2[j] -= lr * dy * z[j];
+                m->w1[j] -= lr * dz * x;
+                m->b1[j] -= lr * dz;
+            }
+            m->b2 -= lr * dy;
+        }
+    }
+
+    /* New knowledge is now the "healthy" state */
+    memcpy(agent->phi.backup, agent->phi.working, TCW_PHI_SIZE_BYTES);
+    agent->phi.checksum = tcw_crc32(agent->phi.working, TCW_PHI_SIZE_BYTES);
     return TCW_OK;
 }
 
@@ -71,63 +121,87 @@ tcw_status_t tcw_repair(tcw_agent_t *agent) {
     return TCW_OK;
 }
 
+/* ============================================================
+ * Aging: zero weights with smallest |w|.
+ * Number to zero = (1 - rank/max_rank) * N_WEIGHTS (cumulative).
+ * After each aging step, backup is synced (irreversible).
+ * ============================================================ */
 tcw_status_t tcw_aging(tcw_agent_t *agent, uint16_t delta_rank) {
     if (!agent) return TCW_ERR_INVALID_ARG;
     if (!agent->phi.alive) return TCW_ERR_DEAD;
 
-    uint16_t old_rank = agent->phi.rank;
-    uint16_t new_rank = (old_rank > delta_rank) ? (uint16_t)(old_rank - delta_rank) : 0;
-    uint16_t lost     = (uint16_t)(old_rank - new_rank);
+    uint16_t old = agent->phi.rank;
+    uint16_t nw  = (old > delta_rank) ? (uint16_t)(old - delta_rank) : 0;
+    agent->phi.rank = nw;
+    if (nw == 0) agent->phi.alive = false;
 
-    size_t bytes_to_zero = ((size_t)TCW_PHI_SIZE_BYTES * lost) / agent->phi.max_rank;
-    if (bytes_to_zero > TCW_PHI_SIZE_BYTES) bytes_to_zero = TCW_PHI_SIZE_BYTES;
+    float *w = (float *)agent->phi.working;
+    float frac_dead = 1.0f - (float)nw / (float)agent->phi.max_rank;
+    int n_to_zero = (int)(frac_dead * (float)TCW_MLP_N_WEIGHTS);
+    if (n_to_zero > TCW_MLP_N_WEIGHTS) n_to_zero = TCW_MLP_N_WEIGHTS;
 
-    /* Aging: zero out "high-rank" bytes (simulates lost knowledge) */
-    memset(&agent->phi.working[TCW_PHI_SIZE_BYTES - bytes_to_zero], 0, bytes_to_zero);
+    /* Iteratively zero the smallest-magnitude non-zero weight */
+    for (int k = 0; k < n_to_zero; k++) {
+        int min_idx = -1;
+        float min_abs = 1e30f;
+        for (int j = 0; j < TCW_MLP_N_WEIGHTS; j++) {
+            if (w[j] != 0.0f && fabsf(w[j]) < min_abs) {
+                min_abs = fabsf(w[j]);
+                min_idx = j;
+            }
+        }
+        if (min_idx < 0) break;
+        w[min_idx] = 0.0f;
+    }
 
-    agent->phi.rank = new_rank;
-    if (new_rank == 0) agent->phi.alive = false;
-
-    /* v0.3 FIX: sync backup with working, so repair restores AGED state,
-       not the youthful one. Aging becomes irreversible — as in biology. */
     memcpy(agent->phi.backup, agent->phi.working, TCW_PHI_SIZE_BYTES);
-
     agent->phi.checksum = tcw_crc32(agent->phi.working, TCW_PHI_SIZE_BYTES);
     return TCW_OK;
 }
 
-tcw_status_t tcw_mutation(tcw_agent_t *agent,
-                          const uint8_t *new_phi, size_t new_size) {
-    if (!agent || !new_phi || new_size > TCW_PHI_SIZE_BYTES) {
-        return TCW_ERR_INVALID_ARG;
-    }
+/* Mutation: random reinit of all weights, small uniform [-0.1, 0.1] */
+tcw_status_t tcw_mutation(tcw_agent_t *agent, uint32_t seed) {
+    if (!agent) return TCW_ERR_INVALID_ARG;
     if (!agent->phi.alive) return TCW_ERR_DEAD;
 
-    memset(agent->phi.working, 0, TCW_PHI_SIZE_BYTES);
-    memcpy(agent->phi.working, new_phi, new_size);
-    memcpy(agent->phi.backup,  agent->phi.working, TCW_PHI_SIZE_BYTES);
+    float *w = (float *)agent->phi.working;
+    uint32_t rng = seed ? seed : 42u;
+    for (int j = 0; j < TCW_MLP_N_WEIGHTS; j++) {
+        int32_t r = (int32_t)xorshift32(&rng);
+        w[j] = ((float)r / 2147483648.0f) * 0.1f;
+    }
+
+    memcpy(agent->phi.backup, agent->phi.working, TCW_PHI_SIZE_BYTES);
     agent->phi.checksum = tcw_crc32(agent->phi.working, TCW_PHI_SIZE_BYTES);
     return TCW_OK;
 }
 
+/* Proliferation: children with per-weight dropout prob p in [0, 1] */
 tcw_status_t tcw_proliferation(const tcw_agent_t *parent,
                                tcw_agent_t *children, size_t n_children,
-                               uint32_t seed) {
+                               uint32_t seed, float dropout_p) {
     if (!parent || !children || n_children == 0) return TCW_ERR_INVALID_ARG;
     if (!parent->phi.alive) return TCW_ERR_DEAD;
+    if (dropout_p < 0.0f) dropout_p = 0.0f;
+    if (dropout_p > 1.0f) dropout_p = 1.0f;
 
     uint32_t rng = seed ? seed : 12345u;
+    uint32_t thresh = (uint32_t)(dropout_p * 4294967040.0f);  /* avoid UINT32_MAX edge */
+
     for (size_t i = 0; i < n_children; i++) {
         children[i].genome = parent->genome;
         children[i].gate   = parent->gate;
 
         memcpy(children[i].phi.working, parent->phi.working, TCW_PHI_SIZE_BYTES);
-        for (size_t j = 0; j < TCW_PHI_SIZE_BYTES; j++) {
-            if ((xorshift32(&rng) & 0x1Fu) == 0) {
-                children[i].phi.working[j] = 0;
+        memcpy(children[i].phi.backup,  parent->phi.backup,  TCW_PHI_SIZE_BYTES);
+
+        float *w = (float *)children[i].phi.working;
+        for (int j = 0; j < TCW_MLP_N_WEIGHTS; j++) {
+            if (xorshift32(&rng) < thresh) {
+                w[j] = 0.0f;
             }
         }
-        memcpy(children[i].phi.backup, children[i].phi.working, TCW_PHI_SIZE_BYTES);
+
         children[i].phi.size     = parent->phi.size;
         children[i].phi.rank     = parent->phi.rank;
         children[i].phi.max_rank = parent->phi.max_rank;

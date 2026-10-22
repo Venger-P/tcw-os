@@ -6,53 +6,65 @@
 #include "tcw_ai.h"
 
 /* ============================================================
- * TCW-OS v0.5: Full Lifecycle with Proliferation
- *   Birth -> Aging -> Mutation -> Damage -> Repair
- *         -> Proliferation -> Death
+ * TCW-OS v0.6 — Full TCW-Life with learnable PHI
  *
- * 6 threads (priority; lower number = higher):
- *   repair         (1) — restores PHI on damage
- *   aging          (2) — alpha = rank/max_rank every 600ms
- *   control        (3) — aggregates, prints lifecycle
- *   mutation       (4) — alpha,beta <- new env every 1400ms
- *   inference      (5) — damages every 5th iter
- *   proliferation  (6) — 3 children every 3000ms
+ * PHI = residual MLP (1->8->1, tanh, 25 weights = 100 bytes).
+ * y_pred(x) = y_model(x) + PHI(x / 2pi)
  *
- * PHI = 8 bytes = (alpha, beta), y = alpha * y_model + beta
- * Children inherit genome C (model, Read-Only), get own masked PHI.
+ * 7 threads (priority; lower = higher):
+ *   repair         (1) : restore PHI from backup
+ *   etopo          (2) : SGD train PHI on D_train (metabolism)
+ *   aging          (3) : zero smallest-|w| weights, rank-=2
+ *   control        (4) : aggregates lifecycle + prints homeostasis
+ *   mutation       (5) : random reinit PHI (new environment)
+ *   inference      (6) : y_pred, MSE, damage every 5th iter
+ *   proliferation  (7) : 3 children with 25% dropout
+ *
+ * Homeostasis metric: held-out MSE (10 clean points, unseen by etopo)
+ * after each operation. Should stay low across R/A/M/P.
+ * E_topo is the ONE operation that can drift it (by design — learning).
  * ============================================================ */
 
 #define STACK_SIZE               4096
 #define PRIO_REPAIR              1
-#define PRIO_AGING               2
-#define PRIO_CONTROL             3
-#define PRIO_MUTATION            4
-#define PRIO_INFERENCE           5
-#define PRIO_PROLIFERATION       6
+#define PRIO_ETOPO               2
+#define PRIO_AGING               3
+#define PRIO_CONTROL             4
+#define PRIO_MUTATION            5
+#define PRIO_INFERENCE           6
+#define PRIO_PROLIFERATION       7
 
 #define DEMO_ITERATIONS          30
 #define DAMAGE_EVERY_N           5
 #define AGING_EVERY_MS           600
 #define MUTATION_EVERY_MS        1400
+#define ETOPO_EVERY_MS           2500
 #define PROLIFERATION_EVERY_MS   3000
 #define AGING_STEP               2
 #define N_CHILDREN               3
+#define PROLIF_DROPOUT_P         0.25f
+
+#define ETOPO_EPOCHS             30
+#define ETOPO_LR                 0.05f
+#define ETOPO_BATCH              20
+
+#define TWO_PI                   6.28318530718f
 
 enum msg_type {
     MSG_INFERENCE_RESULT,
     MSG_REPAIR_COMPLETE,
-    MSG_REPAIR_FAILED,
     MSG_AGING_DONE,
     MSG_MUTATION_DONE,
     MSG_PROGENY_DONE,
+    MSG_ETOPO_DONE,
+    MSG_HELDOUT,
 };
 
 struct msg {
     enum msg_type type;
     uint32_t      iter;
-    float         alpha;
-    float         beta;
     float         mse;
+    float         heldout_mse;
     uint16_t      rank;
 };
 
@@ -62,49 +74,39 @@ K_MUTEX_DEFINE(phi_lock);
 
 static tcw_agent_t agent;
 
-/* ------- calibration helpers ------- */
-static void read_calib(float *a, float *b) {
-    memcpy(a, agent.phi.working,     4);
-    memcpy(b, agent.phi.working + 4, 4);
-}
-static void write_calib(float a, float b) {
-    memcpy(agent.phi.working,     &a, 4);
-    memcpy(agent.phi.working + 4, &b, 4);
+/* === Homeostasis: held-out MSE (10 clean points, always) === */
+static float compute_heldout_mse(void) {
+    float sum = 0.0f;
+    for (int k = 0; k < 10; k++) {
+        float x  = ((float)k + 0.5f) / 10.0f * TWO_PI;
+        float xn = x / TWO_PI;
+        float ym = tcw_ai_infer_raw(x);
+        float yc = tcw_mlp_forward((const tcw_mlp_t *)agent.phi.working, xn);
+        float yp = ym + yc;
+        float yt = sinf(x);
+        float e  = yp - yt;
+        sum += e * e;
+    }
+    return sum / 10.0f;
 }
 
-static void sanitize_calib(void) {
-    float a, b;
-    read_calib(&a, &b);
-    if (!isfinite(a) || !isfinite(b) || fabsf(a) > 100.0f || fabsf(b) > 100.0f) {
-        write_calib(5.0f, -2.0f);
+static void sanitize_phi(void) {
+    float *w = (float *)agent.phi.working;
+    for (int j = 0; j < TCW_MLP_N_WEIGHTS; j++) {
+        if (!isfinite(w[j]) || fabsf(w[j]) > 100.0f) {
+            w[j] = 0.5f;
+        }
     }
 }
 
-static tcw_status_t aging_calib(tcw_agent_t *ag, uint16_t delta) {
-    if (!ag || !ag->phi.alive) return TCW_ERR_DEAD;
-
-    uint16_t old = ag->phi.rank;
-    uint16_t nw  = (old > delta) ? (uint16_t)(old - delta) : 0;
-    ag->phi.rank = nw;
-    if (nw == 0) ag->phi.alive = false;
-
-    float a = (float)nw / (float)ag->phi.max_rank;
-    float b;
-    memcpy(&b, ag->phi.working + 4, 4);
-    write_calib(a, b);
-    memcpy(ag->phi.backup, ag->phi.working, TCW_PHI_SIZE_BYTES);
-    ag->phi.checksum = tcw_crc32(ag->phi.working, TCW_PHI_SIZE_BYTES);
-    return TCW_OK;
-}
-
-/* ================== INFERENCE (prio 5) ================== */
+/* ================== INFERENCE (prio 6) ================== */
 static void inference_thread(void *a, void *b, void *c)
 {
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 
     for (int iter = 1; iter <= DEMO_ITERATIONS; iter++) {
         if (!agent.phi.alive) {
-            printk("[INFERENCE] iter=%d: agent is DEAD, skipping\n", iter);
+            printk("[INFERENCE] iter=%d: DEAD, skipping\n", iter);
             k_sleep(K_MSEC(200));
             continue;
         }
@@ -112,47 +114,76 @@ static void inference_thread(void *a, void *b, void *c)
         if (iter % DAMAGE_EVERY_N == 0) {
             k_mutex_lock(&phi_lock, K_FOREVER);
             tcw_damage(&agent, TCW_PHI_SIZE_BYTES, (uint32_t)iter);
-            sanitize_calib();
-            float a, b;
-            read_calib(&a, &b);
+            sanitize_phi();
             k_mutex_unlock(&phi_lock);
-
-            printk("[INFERENCE] iter=%d -- PHI CORRUPTED (a=%.2f, b=%.2f)\n",
-                   iter, (double)a, (double)b);
-
+            printk("[INFERENCE] iter=%d -- PHI CORRUPTED\n", iter);
             struct msg r = { .type = MSG_INFERENCE_RESULT, .iter = iter };
             k_msgq_put(&queue_to_repair, &r, K_NO_WAIT);
             k_sleep(K_MSEC(200));
             continue;
         }
 
-        float x = ((float)iter / (float)DEMO_ITERATIONS) * (2.0f * 3.14159265f);
+        float x  = ((float)iter / (float)DEMO_ITERATIONS) * TWO_PI;
+        float xn = x / TWO_PI;
 
         k_mutex_lock(&phi_lock, K_FOREVER);
-        float y_model = tcw_ai_infer_raw(x);
-        float alpha, beta;
-        read_calib(&alpha, &beta);
+        float ym = tcw_ai_infer_raw(x);
+        float yc = tcw_mlp_forward((const tcw_mlp_t *)agent.phi.working, xn);
         uint16_t rank = agent.phi.rank;
         k_mutex_unlock(&phi_lock);
 
-        float y_pred = alpha * y_model + beta;
-        float y_true = sinf(x);
-        float err    = (y_pred - y_true) * (y_pred - y_true);
+        float yp = ym + yc;
+        float yt = sinf(x);
+        float err = (yp - yt) * (yp - yt);
 
-        printk("[INFERENCE] iter=%d x=%.2f y_pred=%.3f y_true=%.3f err=%.4f a=%.2f b=%.2f rank=%u\n",
-               iter, (double)x, (double)y_pred, (double)y_true,
-               (double)err, (double)alpha, (double)beta, rank);
+        printk("[INFERENCE] iter=%d x=%.2f y=%.3f y_true=%.3f err=%.5f rank=%u\n",
+               iter, (double)x, (double)yp, (double)yt, (double)err, rank);
 
-        struct msg m = {
-            .type = MSG_INFERENCE_RESULT, .iter = iter,
-            .alpha = alpha, .beta = beta, .mse = err, .rank = rank,
-        };
+        struct msg m = { .type = MSG_INFERENCE_RESULT, .iter = iter,
+                         .mse = err, .rank = rank };
         k_msgq_put(&queue_to_control, &m, K_NO_WAIT);
         k_sleep(K_MSEC(200));
     }
-
     printk("\n[INFERENCE] Demo complete\n");
     k_sleep(K_SECONDS(2));
+}
+
+/* ================== ETOPO (prio 2): metabolism ================== */
+static void etopo_thread(void *a, void *b, void *c)
+{
+    ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+
+    while (1) {
+        k_sleep(K_MSEC(ETOPO_EVERY_MS));
+        if (!agent.phi.alive) {
+            printk("[ETOPO    ] parent dead, stopping\n");
+            return;
+        }
+
+        /* D_train: 20 points of sine + tiny high-freq noise.
+         * Target for PHI = y_true(x) - y_model(x). */
+        float x_train[ETOPO_BATCH], y_train[ETOPO_BATCH];
+        for (int k = 0; k < ETOPO_BATCH; k++) {
+            float x = (float)k / (float)ETOPO_BATCH * TWO_PI;
+            float y_noisy = sinf(x) + 0.05f * sinf(5.0f * x);
+            x_train[k] = x / TWO_PI;
+            y_train[k] = y_noisy - tcw_ai_infer_raw(x);
+        }
+
+        k_mutex_lock(&phi_lock, K_FOREVER);
+        tcw_status_t s = tcw_etopo(&agent, x_train, y_train,
+                                    ETOPO_BATCH, ETOPO_LR, ETOPO_EPOCHS);
+        float ho = compute_heldout_mse();
+        k_mutex_unlock(&phi_lock);
+
+        if (s == TCW_OK) {
+            printk("[ETOPO    ] trained %d epochs on %d noisy samples, held-out MSE=%.5f\n",
+                   ETOPO_EPOCHS, ETOPO_BATCH, (double)ho);
+            struct msg m = { .type = MSG_ETOPO_DONE, .iter = 0,
+                             .heldout_mse = ho, .rank = agent.phi.rank };
+            k_msgq_put(&queue_to_control, &m, K_NO_WAIT);
+        }
+    }
 }
 
 /* ================== REPAIR (prio 1) ================== */
@@ -166,27 +197,22 @@ static void repair_thread(void *a, void *b, void *c)
 
         k_mutex_lock(&phi_lock, K_FOREVER);
         tcw_status_t s = tcw_repair(&agent);
-        float alpha, beta;
-        read_calib(&alpha, &beta);
-        uint16_t rank = agent.phi.rank;
+        float ho = compute_heldout_mse();
         k_mutex_unlock(&phi_lock);
 
-        struct msg resp = {
-            .type = (s == TCW_OK) ? MSG_REPAIR_COMPLETE : MSG_REPAIR_FAILED,
-            .iter = m.iter, .alpha = alpha, .beta = beta, .rank = rank,
-        };
-
         if (s == TCW_OK) {
-            printk("[REPAIR   ] SUCCESS iter=%u -> a=%.2f b=%.2f rank=%u\n",
-                   m.iter, (double)alpha, (double)beta, rank);
+            printk("[REPAIR   ] SUCCESS iter=%u, held-out MSE=%.5f\n",
+                   m.iter, (double)ho);
         } else {
             printk("[REPAIR   ] FAILED iter=%u (code %d)\n", m.iter, s);
         }
-        k_msgq_put(&queue_to_control, &resp, K_NO_WAIT);
+        struct msg r = { .type = MSG_REPAIR_COMPLETE, .iter = m.iter,
+                         .heldout_mse = ho, .rank = agent.phi.rank };
+        k_msgq_put(&queue_to_control, &r, K_NO_WAIT);
     }
 }
 
-/* ================== AGING (prio 2) ================== */
+/* ================== AGING (prio 3) ================== */
 static void aging_thread(void *a, void *b, void *c)
 {
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
@@ -196,66 +222,50 @@ static void aging_thread(void *a, void *b, void *c)
         if (!agent.phi.alive) return;
 
         k_mutex_lock(&phi_lock, K_FOREVER);
-        tcw_status_t s = aging_calib(&agent, AGING_STEP);
-        float alpha, beta;
-        read_calib(&alpha, &beta);
+        tcw_status_t s = tcw_aging(&agent, AGING_STEP);
+        float ho = compute_heldout_mse();
         uint16_t rank = agent.phi.rank;
         bool alive = agent.phi.alive;
         k_mutex_unlock(&phi_lock);
 
         if (s == TCW_OK) {
-            printk("[AGING    ] rank->%u a=%.3f%s\n",
-                   rank, (double)alpha, alive ? "" : "  *** DEAD ***");
-            struct msg m = {
-                .type = MSG_AGING_DONE, .iter = 0,
-                .alpha = alpha, .beta = beta, .rank = rank,
-            };
+            printk("[AGING    ] rank->%u held-out MSE=%.5f%s\n",
+                   rank, (double)ho, alive ? "" : "  *** DEAD ***");
+            struct msg m = { .type = MSG_AGING_DONE, .rank = rank,
+                             .heldout_mse = ho };
             k_msgq_put(&queue_to_control, &m, K_NO_WAIT);
             if (!alive) return;
         }
     }
 }
 
-/* ================== MUTATION (prio 4) ================== */
+/* ================== MUTATION (prio 5) ================== */
 static void mutation_thread(void *a, void *b, void *c)
 {
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 
     int count = 0;
-    uint8_t new_phi[TCW_PHI_SIZE_BYTES];
-
     while (1) {
         k_sleep(K_MSEC(MUTATION_EVERY_MS));
         if (!agent.phi.alive) return;
 
         count++;
-        float na = 1.0f + 0.05f * (float)count;
-        float nb = 0.02f * (float)count;
-        memcpy(new_phi,     &na, 4);
-        memcpy(new_phi + 4, &nb, 4);
-
         k_mutex_lock(&phi_lock, K_FOREVER);
-        tcw_status_t s = tcw_mutation(&agent, new_phi, TCW_PHI_SIZE_BYTES);
-        uint16_t rank = agent.phi.rank;
+        tcw_status_t s = tcw_mutation(&agent, (uint32_t)(1000 + count));
+        float ho = compute_heldout_mse();
         k_mutex_unlock(&phi_lock);
 
         if (s == TCW_OK) {
-            printk("[MUTATION ] env #%d -> a=%.2f b=%.2f rank=%u\n",
-                   count, (double)na, (double)nb, rank);
-            struct msg m = {
-                .type = MSG_MUTATION_DONE, .iter = (uint32_t)count,
-                .alpha = na, .beta = nb, .rank = rank,
-            };
+            printk("[MUTATION ] env #%d random reinit, held-out MSE=%.5f\n",
+                   count, (double)ho);
+            struct msg m = { .type = MSG_MUTATION_DONE, .iter = (uint32_t)count,
+                             .heldout_mse = ho, .rank = agent.phi.rank };
             k_msgq_put(&queue_to_control, &m, K_NO_WAIT);
         }
     }
 }
 
-/* ================== PROLIFERATION (prio 6) ==================
- * Creates N_CHILDREN copies of current PHI with dropout mask (5%).
- * Each child shares genome C (the TFLite model, Read-Only).
- * Children are short-lived snapshots — we evaluate them and discard.
- * Demonstrates operation P: spawning with variation. */
+/* ================== PROLIFERATION (prio 7) ================== */
 static void proliferation_thread(void *a, void *b, void *c)
 {
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
@@ -270,109 +280,92 @@ static void proliferation_thread(void *a, void *b, void *c)
             return;
         }
 
-        /* Snapshot parent under lock */
         k_mutex_lock(&phi_lock, K_FOREVER);
-        tcw_agent_t parent_snapshot = agent;
+        tcw_agent_t snap = agent;
         k_mutex_unlock(&phi_lock);
 
-        tcw_status_t s = tcw_proliferation(&parent_snapshot, children, N_CHILDREN,
-                                            (uint32_t)(generation + 1));
+        tcw_status_t s = tcw_proliferation(&snap, children, N_CHILDREN,
+                                            (uint32_t)(generation + 1),
+                                            PROLIF_DROPOUT_P);
         if (s != TCW_OK) continue;
         generation++;
 
-        /* Evaluate each child on 10 points */
-        printk("[PROLIF   ] gen #%d: spawned %d children\n",
-               generation, N_CHILDREN);
-
-        float parent_mse = 0.0f;
-        for (int k = 0; k < 10; k++) {
-            float x = (float)k / 10.0f * 2.0f * 3.14159265f;
-            float ym = tcw_ai_infer_raw(x);
-            float pa, pb;
-            memcpy(&pa, parent_snapshot.phi.working, 4);
-            memcpy(&pb, parent_snapshot.phi.working + 4, 4);
-            float yp = pa * ym + pb;
-            float e = yp - sinf(x);
-            parent_mse += e * e;
-        }
-        parent_mse /= 10.0f;
-        printk("[PROLIF   ]   parent: MSE=%.4f rank=%u\n",
-               (double)parent_mse, parent_snapshot.phi.rank);
+        printk("[PROLIF   ] gen #%d: spawned %d children (dropout %.0f%%)\n",
+               generation, N_CHILDREN, (double)(PROLIF_DROPOUT_P * 100.0f));
 
         for (int i = 0; i < N_CHILDREN; i++) {
-            float ca, cb;
-            memcpy(&ca, children[i].phi.working, 4);
-            memcpy(&cb, children[i].phi.working + 4, 4);
-
             float mse = 0.0f;
             for (int k = 0; k < 10; k++) {
-                float x = (float)k / 10.0f * 2.0f * 3.14159265f;
+                float x  = ((float)k + 0.5f) / 10.0f * TWO_PI;
+                float xn = x / TWO_PI;
                 float ym = tcw_ai_infer_raw(x);
-                float yp = ca * ym + cb;
-                float e = yp - sinf(x);
+                float yc = tcw_mlp_forward((const tcw_mlp_t *)children[i].phi.working, xn);
+                float yp = ym + yc;
+                float e  = yp - sinf(x);
                 mse += e * e;
             }
             mse /= 10.0f;
-
-            printk("[PROLIF   ]   child#%d: a=%.2f b=%.2f rank=%u MSE=%.4f\n",
-                   i + 1, (double)ca, (double)cb,
-                   children[i].phi.rank, (double)mse);
+            printk("[PROLIF   ]   child#%d held-out MSE=%.5f\n",
+                   i + 1, (double)mse);
         }
 
-        struct msg m = {
-            .type = MSG_PROGENY_DONE, .iter = (uint32_t)generation,
-            .rank = parent_snapshot.phi.rank,
-        };
+        struct msg m = { .type = MSG_PROGENY_DONE, .iter = (uint32_t)generation };
         k_msgq_put(&queue_to_control, &m, K_NO_WAIT);
     }
 }
 
-/* ================== CONTROL (prio 3) ================== */
+/* ================== CONTROL (prio 4) ================== */
 static void control_thread(void *a, void *b, void *c)
 {
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 
-    int damages = 0, repairs_ok = 0, repairs_failed = 0;
-    int agings = 0, mutations = 0, proliferations = 0;
-    float mse_sum = 0.0f;
+    int damages = 0, repairs = 0, agings = 0, mutations = 0,
+        proliferations = 0, etopos = 0;
+    float mse_sum = 0.0f, mse_min = 1e9f, mse_max = 0.0f;
     int mse_cnt = 0;
-    float mse_min = 1e9f, mse_max = 0.0f;
+    float ho_sum = 0.0f, ho_min = 1e9f, ho_max = 0.0f;
+    int ho_cnt = 0;
 
     while (1) {
         struct msg m;
         k_msgq_get(&queue_to_control, &m, K_FOREVER);
 
-        switch (m.type) {
-        case MSG_INFERENCE_RESULT:
+        if (m.type == MSG_INFERENCE_RESULT) {
             if (m.mse > 0.0f && m.mse < 1e3f) {
                 mse_sum += m.mse; mse_cnt++;
                 if (m.mse < mse_min) mse_min = m.mse;
                 if (m.mse > mse_max) mse_max = m.mse;
             }
-            break;
+            damages++;
+            continue;
+        }
 
-        case MSG_REPAIR_COMPLETE: repairs_ok++; damages++; break;
-        case MSG_REPAIR_FAILED:   repairs_failed++; break;
+        if (m.heldout_mse > 0.0f) {
+            ho_sum += m.heldout_mse; ho_cnt++;
+            if (m.heldout_mse < ho_min) ho_min = m.heldout_mse;
+            if (m.heldout_mse > ho_max) ho_max = m.heldout_mse;
+        }
+
+        switch (m.type) {
+        case MSG_REPAIR_COMPLETE: repairs++; break;
         case MSG_AGING_DONE:
             agings++;
             if (m.rank == 0) {
-                printk("\n[CONTROL  ] *** AGENT DIED OF OLD AGE (rank=0, a=0) ***\n");
-                printk("[CONTROL  ] LIFECYCLE: damages=%d, repairs_ok=%d, "
-                       "repairs_failed=%d, agings=%d, mutations=%d, proliferations=%d\n",
-                       damages, repairs_ok, repairs_failed,
-                       agings, mutations, proliferations);
-                if (mse_cnt > 0) {
-                    printk("[CONTROL  ] MSE: min=%.4f max=%.4f avg=%.4f\n\n",
-                           (double)mse_min, (double)mse_max,
-                           (double)(mse_sum / mse_cnt));
-                }
+                printk("\n[CONTROL  ] *** AGENT DIED OF OLD AGE (rank=0) ***\n");
+                printk("[CONTROL  ] LIFECYCLE: damages=%d, repairs=%d, "
+                       "agings=%d, mutations=%d, proliferations=%d, etopos=%d\n",
+                       damages, repairs, agings, mutations, proliferations, etopos);
+                if (mse_cnt)
+                    printk("[CONTROL  ] infer MSE:   min=%.5f max=%.5f avg=%.5f\n",
+                           (double)mse_min, (double)mse_max, (double)(mse_sum/mse_cnt));
+                if (ho_cnt)
+                    printk("[CONTROL  ] held-out MSE: min=%.5f max=%.5f avg=%.5f\n",
+                           (double)ho_min, (double)ho_max, (double)(ho_sum/ho_cnt));
             }
             break;
         case MSG_MUTATION_DONE: mutations++; break;
-        case MSG_PROGENY_DONE:
-            proliferations++;
-            printk("[CONTROL  ] PROGENY #%u confirmed\n", m.iter);
-            break;
+        case MSG_PROGENY_DONE:  proliferations++; break;
+        case MSG_ETOPO_DONE:    etopos++; break;
         default: break;
         }
     }
@@ -382,11 +375,12 @@ static void control_thread(void *a, void *b, void *c)
 K_THREAD_STACK_DEFINE(inference_stack,     STACK_SIZE);
 K_THREAD_STACK_DEFINE(repair_stack,        STACK_SIZE);
 K_THREAD_STACK_DEFINE(aging_stack,         STACK_SIZE);
+K_THREAD_STACK_DEFINE(etopo_stack,         STACK_SIZE);
 K_THREAD_STACK_DEFINE(mutation_stack,      STACK_SIZE);
 K_THREAD_STACK_DEFINE(proliferation_stack, STACK_SIZE);
 K_THREAD_STACK_DEFINE(control_stack,       STACK_SIZE);
 
-static struct k_thread inference_tcb, repair_tcb, aging_tcb,
+static struct k_thread inference_tcb, repair_tcb, aging_tcb, etopo_tcb,
                       mutation_tcb, proliferation_tcb, control_tcb;
 
 /* ================== ENTRY ================== */
@@ -394,26 +388,32 @@ int main(void)
 {
     printk("\n");
     printk("==================================================\n");
-    printk("  TCW-OS v0.5: Full Lifecycle with Proliferation\n");
-    printk("  R + A + M + P on real TFLite model (INT8)\n");
+    printk("  TCW-OS v0.6: Full TCW-Life (learnable PHI)\n");
+    printk("  PHI = residual MLP (1->8->1, tanh, 25 weights)\n");
+    printk("  E_topo + R + A + M + P on real TFLite model\n");
     printk("==================================================\n\n");
 
     tcw_ai_init();
-    printk("TFLite Micro initialized (sine-wave model, INT8)\n");
+    printk("TFLite Micro: sine-wave model (INT8), frozen as C (genome)\n");
 
+    /* Genome: initial PHI = zeros (MLP outputs 0, y_pred = y_model) */
     uint8_t genome[TCW_PHI_SIZE_BYTES];
-    float a0 = 1.0f, b0 = 0.0f;
-    memcpy(genome,     &a0, 4);
-    memcpy(genome + 4, &b0, 4);
+    memset(genome, 0, TCW_PHI_SIZE_BYTES);
 
     tcw_status_t s = tcw_init(&agent, genome, TCW_PHI_SIZE_BYTES, 16);
     if (s != TCW_OK) { printk("FATAL: tcw_init failed\n"); return 0; }
-    printk("Agent born: rank=%u, a=%.2f b=%.2f (perfect baseline)\n\n",
-           agent.phi.rank, (double)a0, (double)b0);
+    printk("Agent born: rank=%u, PHI=0 (y_pred = y_model)\n", agent.phi.rank);
+
+    float ho = compute_heldout_mse();
+    printk("Baseline held-out MSE = %.5f\n\n", (double)ho);
 
     k_thread_create(&repair_tcb, repair_stack, STACK_SIZE,
                     repair_thread, NULL, NULL, NULL, PRIO_REPAIR, 0, K_NO_WAIT);
     k_thread_name_set(&repair_tcb, "tcw_repair");
+
+    k_thread_create(&etopo_tcb, etopo_stack, STACK_SIZE,
+                    etopo_thread, NULL, NULL, NULL, PRIO_ETOPO, 0, K_NO_WAIT);
+    k_thread_name_set(&etopo_tcb, "tcw_etopo");
 
     k_thread_create(&aging_tcb, aging_stack, STACK_SIZE,
                     aging_thread, NULL, NULL, NULL, PRIO_AGING, 0, K_NO_WAIT);
