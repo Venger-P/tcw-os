@@ -6,12 +6,22 @@
 #include "tcw_ai.h"
 
 /* ============================================================
- * TCW-OS v0.6.1 — Full TCW-Life (3 fixes over v0.6)
+ * TCW-OS v0.7 — Ontogeny (continual learning without forgetting)
  *
- * Fixes:
- *   1. damage counter: only increments on corrupted=1
- *   2. etopo starts at 400ms (before first aging at 600ms)
- *   3. mutation range [-0.5, 0.5] (was [-0.1, 0.1]) — see tcw_runtime.c
+ * Sequential tasks:
+ *   T1: x in [0,   pi/2]   (quadrant I)
+ *   T2: x in [pi/2, pi]    (quadrant II)
+ *   T3: x in [pi, 3*pi/2]  (quadrant III)
+ *
+ * For each task N:
+ *   - Generate 20 fresh points
+ *   - Mix with replay_buf (10 pts from each earlier task)
+ *   - tcw_etopo: 30 epochs SGD on combined batch
+ *   - Evaluate MSE on T1..TN  -> detect forgetting
+ *   - Append 10 pts of TN to replay_buf (max 30)
+ *
+ * Aging/mutation wait for ontogeny_done flag.
+ * After ontogeny, ontogeny_thread switches to continuous etopo on all tasks.
  * ============================================================ */
 
 #define STACK_SIZE               4096
@@ -27,17 +37,24 @@
 #define DAMAGE_EVERY_N           5
 #define AGING_EVERY_MS           600
 #define MUTATION_EVERY_MS        1400
-#define ETOPO_EVERY_MS           400     /* v0.6.1: was 2500 */
 #define PROLIFERATION_EVERY_MS   3000
 #define AGING_STEP               2
 #define N_CHILDREN               3
 #define PROLIF_DROPOUT_P         0.25f
 
-#define ETOPO_EPOCHS             30
+#define ETOPO_EPOCHS             40
 #define ETOPO_LR                 0.05f
 #define ETOPO_BATCH              20
+#define REPLAY_PER_TASK          10
+#define REPLAY_MAX               30
 
 #define TWO_PI                   6.28318530718f
+#define T1_XMIN                  0.0f
+#define T1_XMAX                  (TWO_PI / 4.0f)
+#define T2_XMIN                  (TWO_PI / 4.0f)
+#define T2_XMAX                  (TWO_PI / 2.0f)
+#define T3_XMIN                  (TWO_PI / 2.0f)
+#define T3_XMAX                  (3.0f * TWO_PI / 4.0f)
 
 enum msg_type {
     MSG_INFERENCE_RESULT,
@@ -46,6 +63,8 @@ enum msg_type {
     MSG_MUTATION_DONE,
     MSG_PROGENY_DONE,
     MSG_ETOPO_DONE,
+    MSG_ONTogeny_PROGRESS,
+    MSG_ONTogeny_DONE,
 };
 
 struct msg {
@@ -54,7 +73,8 @@ struct msg {
     float         mse;
     float         heldout_mse;
     uint16_t      rank;
-    uint8_t       corrupted;   /* v0.6.1: 1 if damage occurred */
+    uint8_t       corrupted;
+    uint8_t       task_id;
 };
 
 K_MSGQ_DEFINE(queue_to_control, sizeof(struct msg), 64, 4);
@@ -62,7 +82,70 @@ K_MSGQ_DEFINE(queue_to_repair,  sizeof(struct msg), 8,  4);
 K_MUTEX_DEFINE(phi_lock);
 
 static tcw_agent_t agent;
+static volatile bool ontogeny_done = false;
 
+/* ================== Replay buffer ================== */
+typedef struct {
+    float x;         /* normalized: x / TWO_PI */
+    float y_target;  /* residual: sin(x) - y_model(x) */
+} sample_t;
+
+static sample_t replay_buf[REPLAY_MAX];
+static int replay_n = 0;
+
+/* ================== Task data generation & eval ================== */
+static void generate_task_data(float xmin, float xmax, int n,
+                                float *x_out, float *y_out) {
+    for (int i = 0; i < n; i++) {
+        float x = xmin + (xmax - xmin) * (float)i / (float)(n - 1);
+        x_out[i] = x / TWO_PI;
+        y_out[i] = sinf(x) - tcw_ai_infer_raw(x);
+    }
+}
+
+static float eval_task(float xmin, float xmax, int n) {
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float x = xmin + (xmax - xmin) * (float)i / (float)(n - 1);
+        float ym = tcw_ai_infer_raw(x);
+        float yc = tcw_mlp_forward((const tcw_mlp_t *)agent.phi.working, x / TWO_PI);
+        float yp = ym + yc;
+        float e  = yp - sinf(x);
+        sum += e * e;
+    }
+    return sum / (float)n;
+}
+
+static void train_on_task(float xmin, float xmax) {
+    float x_new[ETOPO_BATCH], y_new[ETOPO_BATCH];
+    generate_task_data(xmin, xmax, ETOPO_BATCH, x_new, y_new);
+
+    /* Combined batch: new + replay */
+    float x_batch[ETOPO_BATCH + REPLAY_MAX];
+    float y_batch[ETOPO_BATCH + REPLAY_MAX];
+    int nb = 0;
+    for (int i = 0; i < ETOPO_BATCH; i++) {
+        x_batch[nb] = x_new[i]; y_batch[nb] = y_new[i]; nb++;
+    }
+    for (int i = 0; i < replay_n; i++) {
+        x_batch[nb] = replay_buf[i].x; y_batch[nb] = replay_buf[i].y_target; nb++;
+    }
+
+    k_mutex_lock(&phi_lock, K_FOREVER);
+    tcw_etopo(&agent, x_batch, y_batch, nb, ETOPO_LR, ETOPO_EPOCHS);
+    k_mutex_unlock(&phi_lock);
+
+    /* Append 10 points of new task to replay */
+    for (int i = 0; i < REPLAY_PER_TASK && replay_n < REPLAY_MAX; i++) {
+        int idx = i * 2;  /* every 2nd point */
+        if (idx >= ETOPO_BATCH) idx = ETOPO_BATCH - 1;
+        replay_buf[replay_n].x = x_new[idx];
+        replay_buf[replay_n].y_target = y_new[idx];
+        replay_n++;
+    }
+}
+
+/* ================== Homeostasis: held-out MSE ================== */
 static float compute_heldout_mse(void) {
     float sum = 0.0f;
     for (int k = 0; k < 10; k++) {
@@ -71,8 +154,7 @@ static float compute_heldout_mse(void) {
         float ym = tcw_ai_infer_raw(x);
         float yc = tcw_mlp_forward((const tcw_mlp_t *)agent.phi.working, xn);
         float yp = ym + yc;
-        float yt = sinf(x);
-        float e  = yp - yt;
+        float e  = yp - sinf(x);
         sum += e * e;
     }
     return sum / 10.0f;
@@ -81,9 +163,100 @@ static float compute_heldout_mse(void) {
 static void sanitize_phi(void) {
     float *w = (float *)agent.phi.working;
     for (int j = 0; j < TCW_MLP_N_WEIGHTS; j++) {
-        if (!isfinite(w[j]) || fabsf(w[j]) > 100.0f) {
-            w[j] = 0.5f;
+        if (!isfinite(w[j]) || fabsf(w[j]) > 100.0f) w[j] = 0.5f;
+    }
+}
+
+/* ================== ONTOGENY (prio 2) ================== */
+static void ontogeny_thread(void *a, void *b, void *c)
+{
+    ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+
+    printk("\n[ONTOGENY] ============================================\n");
+    printk("[ONTOGENY] Sequential learning: T1 -> T2 -> T3\n");
+    printk("[ONTOGENY] Replay: %d pts per completed task\n", REPLAY_PER_TASK);
+    printk("[ONTOGENY] ============================================\n");
+
+    /* Before training: evaluate baseline (PHI=0) */
+    float m1_0 = eval_task(T1_XMIN, T1_XMAX, 10);
+    float m2_0 = eval_task(T2_XMIN, T2_XMAX, 10);
+    float m3_0 = eval_task(T3_XMIN, T3_XMAX, 10);
+    printk("[ONTOGENY] Before training (PHI=0): T1=%.5f T2=%.5f T3=%.5f\n",
+           (double)m1_0, (double)m2_0, (double)m3_0);
+
+    /* === T1 === */
+    printk("[ONTOGENY] --- Task 1: x in [0, pi/2] ---\n");
+    train_on_task(T1_XMIN, T1_XMAX);
+    float m1_1 = eval_task(T1_XMIN, T1_XMAX, 10);
+    printk("[ONTOGENY] T1 done. T1 MSE = %.5f (was %.5f)\n",
+           (double)m1_1, (double)m1_0);
+    k_sleep(K_MSEC(300));
+
+    /* === T2 (replay T1) === */
+    printk("[ONTOGENY] --- Task 2: x in [pi/2, pi] + replay T1 ---\n");
+    train_on_task(T2_XMIN, T2_XMAX);
+    float m1_2 = eval_task(T1_XMIN, T1_XMAX, 10);
+    float m2_2 = eval_task(T2_XMIN, T2_XMAX, 10);
+    printk("[ONTOGENY] T2 done. T1=%.5f T2=%.5f\n",
+           (double)m1_2, (double)m2_2);
+    printk("[ONTOGENY] Forgetting on T1: dMSE=%+.5f (%+.1f%%)\n",
+           (double)(m1_2 - m1_1),
+           (double)(100.0f * (m1_2 - m1_1) / m1_1));
+    k_sleep(K_MSEC(300));
+
+    /* === T3 (replay T1 + T2) === */
+    printk("[ONTOGENY] --- Task 3: x in [pi, 3pi/2] + replay T1,T2 ---\n");
+    train_on_task(T3_XMIN, T3_XMAX);
+    float m1_3 = eval_task(T1_XMIN, T1_XMAX, 10);
+    float m2_3 = eval_task(T2_XMIN, T2_XMAX, 10);
+    float m3_3 = eval_task(T3_XMIN, T3_XMAX, 10);
+    printk("[ONTOGENY] T3 done. T1=%.5f T2=%.5f T3=%.5f\n",
+           (double)m1_3, (double)m2_3, (double)m3_3);
+    printk("[ONTOGENY] Forgetting on T1: dMSE=%+.5f (%+.1f%%)\n",
+           (double)(m1_3 - m1_1),
+           (double)(100.0f * (m1_3 - m1_1) / m1_1));
+    printk("[ONTOGENY] Forgetting on T2: dMSE=%+.5f (%+.1f%%)\n",
+           (double)(m2_3 - m2_2),
+           (double)(100.0f * (m2_3 - m2_2) / m2_2));
+    printk("[ONTOGENY] ============================================\n");
+    printk("[ONTOGENY] Sequential learning complete. Aging/mutation unlocked.\n");
+    printk("[ONTOGENY] ============================================\n\n");
+
+    ontogeny_done = true;
+
+    struct msg dm = { .type = MSG_ONTogeny_DONE, .heldout_mse = m1_3 };
+    k_msgq_put(&queue_to_control, &dm, K_NO_WAIT);
+
+    /* === Continuous etopo on ALL tasks (metabolism) === */
+    while (1) {
+        k_sleep(K_MSEC(1500));
+        if (!agent.phi.alive) return;
+
+        float x_all[30], y_all[30];
+        int n = 0;
+        for (int i = 0; i < 10; i++) {
+            float x = T1_XMIN + (T1_XMAX - T1_XMIN) * i / 9.0f;
+            x_all[n] = x / TWO_PI; y_all[n] = sinf(x) - tcw_ai_infer_raw(x); n++;
         }
+        for (int i = 0; i < 10; i++) {
+            float x = T2_XMIN + (T2_XMAX - T2_XMIN) * i / 9.0f;
+            x_all[n] = x / TWO_PI; y_all[n] = sinf(x) - tcw_ai_infer_raw(x); n++;
+        }
+        for (int i = 0; i < 10; i++) {
+            float x = T3_XMIN + (T3_XMAX - T3_XMIN) * i / 9.0f;
+            x_all[n] = x / TWO_PI; y_all[n] = sinf(x) - tcw_ai_infer_raw(x); n++;
+        }
+
+        k_mutex_lock(&phi_lock, K_FOREVER);
+        tcw_etopo(&agent, x_all, y_all, n, ETOPO_LR, ETOPO_EPOCHS);
+        float ho = compute_heldout_mse();
+        k_mutex_unlock(&phi_lock);
+
+        printk("[ETOPO    ] maintained on T1+T2+T3, held-out MSE=%.5f\n",
+               (double)ho);
+        struct msg m = { .type = MSG_ETOPO_DONE, .heldout_mse = ho,
+                         .rank = agent.phi.rank };
+        k_msgq_put(&queue_to_control, &m, K_NO_WAIT);
     }
 }
 
@@ -109,7 +282,6 @@ static void inference_thread(void *a, void *b, void *c)
             struct msg c = { .type = MSG_INFERENCE_RESULT, .iter = iter,
                              .corrupted = 1 };
             k_msgq_put(&queue_to_control, &c, K_NO_WAIT);
-
             struct msg r = { .type = MSG_INFERENCE_RESULT, .iter = iter };
             k_msgq_put(&queue_to_repair, &r, K_NO_WAIT);
             k_sleep(K_MSEC(200));
@@ -141,42 +313,6 @@ static void inference_thread(void *a, void *b, void *c)
     k_sleep(K_SECONDS(2));
 }
 
-/* ================== ETOPO (prio 2) ================== */
-static void etopo_thread(void *a, void *b, void *c)
-{
-    ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
-
-    while (1) {
-        k_sleep(K_MSEC(ETOPO_EVERY_MS));
-        if (!agent.phi.alive) {
-            printk("[ETOPO    ] parent dead, stopping\n");
-            return;
-        }
-
-        float x_train[ETOPO_BATCH], y_train[ETOPO_BATCH];
-        for (int k = 0; k < ETOPO_BATCH; k++) {
-            float x = (float)k / (float)ETOPO_BATCH * TWO_PI;
-            float y_noisy = sinf(x) + 0.05f * sinf(5.0f * x);
-            x_train[k] = x / TWO_PI;
-            y_train[k] = y_noisy - tcw_ai_infer_raw(x);
-        }
-
-        k_mutex_lock(&phi_lock, K_FOREVER);
-        tcw_status_t s = tcw_etopo(&agent, x_train, y_train,
-                                    ETOPO_BATCH, ETOPO_LR, ETOPO_EPOCHS);
-        float ho = compute_heldout_mse();
-        k_mutex_unlock(&phi_lock);
-
-        if (s == TCW_OK) {
-            printk("[ETOPO    ] trained %d epochs, held-out MSE=%.5f\n",
-                   ETOPO_EPOCHS, (double)ho);
-            struct msg m = { .type = MSG_ETOPO_DONE,
-                             .heldout_mse = ho, .rank = agent.phi.rank };
-            k_msgq_put(&queue_to_control, &m, K_NO_WAIT);
-        }
-    }
-}
-
 /* ================== REPAIR (prio 1) ================== */
 static void repair_thread(void *a, void *b, void *c)
 {
@@ -203,10 +339,13 @@ static void repair_thread(void *a, void *b, void *c)
     }
 }
 
-/* ================== AGING (prio 3) ================== */
+/* ================== AGING (prio 3) — waits for ontogeny ================== */
 static void aging_thread(void *a, void *b, void *c)
 {
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+
+    while (!ontogeny_done) k_sleep(K_MSEC(100));
+    printk("[AGING    ] ontogeny complete, starting to age\n");
 
     while (1) {
         k_sleep(K_MSEC(AGING_EVERY_MS));
@@ -230,10 +369,12 @@ static void aging_thread(void *a, void *b, void *c)
     }
 }
 
-/* ================== MUTATION (prio 5) ================== */
+/* ================== MUTATION (prio 5) — waits for ontogeny ================== */
 static void mutation_thread(void *a, void *b, void *c)
 {
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+
+    while (!ontogeny_done) k_sleep(K_MSEC(100));
 
     int count = 0;
     while (1) {
@@ -256,10 +397,12 @@ static void mutation_thread(void *a, void *b, void *c)
     }
 }
 
-/* ================== PROLIFERATION (prio 7) ================== */
+/* ================== PROLIFERATION (prio 7) — waits for ontogeny ================== */
 static void proliferation_thread(void *a, void *b, void *c)
 {
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+
+    while (!ontogeny_done) k_sleep(K_MSEC(100));
 
     static tcw_agent_t children[N_CHILDREN];
     int generation = 0;
@@ -288,9 +431,9 @@ static void proliferation_thread(void *a, void *b, void *c)
             float mse = 0.0f;
             for (int k = 0; k < 10; k++) {
                 float x  = ((float)k + 0.5f) / 10.0f * TWO_PI;
-                float xn = x / TWO_PI;
                 float ym = tcw_ai_infer_raw(x);
-                float yc = tcw_mlp_forward((const tcw_mlp_t *)children[i].phi.working, xn);
+                float yc = tcw_mlp_forward((const tcw_mlp_t *)children[i].phi.working,
+                                            x / TWO_PI);
                 float yp = ym + yc;
                 float e  = yp - sinf(x);
                 mse += e * e;
@@ -322,9 +465,8 @@ static void control_thread(void *a, void *b, void *c)
         k_msgq_get(&queue_to_control, &m, K_FOREVER);
 
         if (m.type == MSG_INFERENCE_RESULT) {
-            if (m.corrupted) {
-                damages++;
-            } else if (m.mse > 0.0f && m.mse < 1e3f) {
+            if (m.corrupted) damages++;
+            else if (m.mse > 0.0f && m.mse < 1e3f) {
                 mse_sum += m.mse; mse_cnt++;
                 if (m.mse < mse_min) mse_min = m.mse;
                 if (m.mse > mse_max) mse_max = m.mse;
@@ -358,6 +500,9 @@ static void control_thread(void *a, void *b, void *c)
         case MSG_MUTATION_DONE: mutations++; break;
         case MSG_PROGENY_DONE:  proliferations++; break;
         case MSG_ETOPO_DONE:    etopos++; break;
+        case MSG_ONTogeny_DONE:
+            printk("[CONTROL  ] Ontogeny complete, lifecycle ops unlocked\n");
+            break;
         default: break;
         }
     }
@@ -380,9 +525,9 @@ int main(void)
 {
     printk("\n");
     printk("==================================================\n");
-    printk("  TCW-OS v0.6.1: Full TCW-Life (fixes)\n");
-    printk("  PHI = residual MLP (1->8->1, tanh, 25 weights)\n");
-    printk("  E_topo + R + A + M + P on real TFLite model\n");
+    printk("  TCW-OS v0.7 — Ontogeny (continual learning)\n");
+    printk("  T1 [0,pi/2] -> T2 [pi/2,pi] -> T3 [pi,3pi/2]\n");
+    printk("  Replay buffer: %d pts/task, no forgetting\n", REPLAY_PER_TASK);
     printk("==================================================\n\n");
 
     tcw_ai_init();
@@ -393,7 +538,7 @@ int main(void)
 
     tcw_status_t s = tcw_init(&agent, genome, TCW_PHI_SIZE_BYTES, 16);
     if (s != TCW_OK) { printk("FATAL: tcw_init failed\n"); return 0; }
-    printk("Agent born: rank=%u, PHI=0 (y_pred = y_model)\n", agent.phi.rank);
+    printk("Agent born: rank=%u, PHI=0\n", agent.phi.rank);
 
     float ho = compute_heldout_mse();
     printk("Baseline held-out MSE = %.5f\n\n", (double)ho);
@@ -403,8 +548,8 @@ int main(void)
     k_thread_name_set(&repair_tcb, "tcw_repair");
 
     k_thread_create(&etopo_tcb, etopo_stack, STACK_SIZE,
-                    etopo_thread, NULL, NULL, NULL, PRIO_ETOPO, 0, K_NO_WAIT);
-    k_thread_name_set(&etopo_tcb, "tcw_etopo");
+                    ontogeny_thread, NULL, NULL, NULL, PRIO_ETOPO, 0, K_NO_WAIT);
+    k_thread_name_set(&etopo_tcb, "tcw_ontogeny");
 
     k_thread_create(&aging_tcb, aging_stack, STACK_SIZE,
                     aging_thread, NULL, NULL, NULL, PRIO_AGING, 0, K_NO_WAIT);
