@@ -35,7 +35,7 @@
 #define COMPOSITION_BURST_COUNT  3
 #define AGING_STEP               2
 #define N_CHILDREN               3
-#define PROLIF_DROPOUT_P         0.25f
+#define PROLIF_DROPOUT_P         0.10f
 
 #define ETOPO_EPOCHS             40
 #define ETOPO_LR                 0.05f
@@ -506,7 +506,15 @@ static void proliferation_thread(void *a, void *b, void *c)
     }
 }
 
-/* ================== COMPOSITION (prio 8) — v0.8.1 timing ================== */
+/* ================== COMPOSITION (prio 8) — v0.8.2 ================== */
+static int count_nonzero(const tcw_agent_t *ag) {
+    const float *w = (const float *)ag->phi.working;
+    int n = 0;
+    for (int j = 0; j < TCW_MLP_N_WEIGHTS; j++)
+        if (w[j] != 0.0f) n++;
+    return n;
+}
+
 static void composition_thread(void *a, void *b, void *c)
 {
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
@@ -516,8 +524,6 @@ static void composition_thread(void *a, void *b, void *c)
     static tcw_agent_t hybrid;
     int gen = 0;
 
-    /* Burst right after ontogeny (before aging kicks in at t=2600ms):
-     * fires at t≈2050, 2250, 2450 ms — PHI still fresh, kids differ */
     for (int burst = 0; burst < COMPOSITION_BURST_COUNT; burst++) {
         k_sleep(K_MSEC(COMPOSITION_BURST_MS));
         if (!agent.phi.alive) return;
@@ -526,7 +532,7 @@ static void composition_thread(void *a, void *b, void *c)
         tcw_agent_t snap = agent;
         k_mutex_unlock(&phi_lock);
 
-        tcw_proliferation(&snap, kids, 2, (uint32_t)(gen * 2 + 7), 0.25f);
+        tcw_proliferation(&snap, kids, 2, (uint32_t)(gen * 2 + 7), PROLIF_DROPOUT_P);
         gen++;
 
         tcw_status_t s = tcw_composition(&hybrid, &kids[0], &kids[1], 0.5f);
@@ -537,15 +543,21 @@ static void composition_thread(void *a, void *b, void *c)
         float m_k2     = eval_agent_mse(&kids[1]);
         float m_hyb    = eval_agent_mse(&hybrid);
 
+        int nz_parent = count_nonzero(&snap);
+        int nz_k1     = count_nonzero(&kids[0]);
+        int nz_k2     = count_nonzero(&kids[1]);
+        int nz_hyb    = count_nonzero(&hybrid);
+
         printk("[COMPOSE  ] burst #%d: parent=%.5f kid1=%.5f kid2=%.5f hybrid=%.5f\n",
                burst + 1, (double)m_parent, (double)m_k1, (double)m_k2, (double)m_hyb);
+        printk("[COMPOSE  ]           nonzero: parent=%d/25 kid1=%d kid2=%d hybrid=%d\n",
+               nz_parent, nz_k1, nz_k2, nz_hyb);
 
         struct msg m = { .type = MSG_COMPOSITION_DONE, .iter = (uint32_t)gen,
                          .mse = m_hyb, .heldout_mse = m_hyb };
         k_msgq_put(&queue_to_control, &m, K_NO_WAIT);
     }
 
-    /* Periodic mode after burst */
     while (1) {
         k_sleep(K_MSEC(COMPOSITION_PERIODIC_MS));
         if (!agent.phi.alive) { printk("[COMPOSE  ] parent dead, stopping\n"); return; }
@@ -554,7 +566,7 @@ static void composition_thread(void *a, void *b, void *c)
         tcw_agent_t snap = agent;
         k_mutex_unlock(&phi_lock);
 
-        tcw_proliferation(&snap, kids, 2, (uint32_t)(gen * 2 + 7), 0.25f);
+        tcw_proliferation(&snap, kids, 2, (uint32_t)(gen * 2 + 7), PROLIF_DROPOUT_P);
         gen++;
 
         tcw_status_t s = tcw_composition(&hybrid, &kids[0], &kids[1], 0.5f);
@@ -567,6 +579,9 @@ static void composition_thread(void *a, void *b, void *c)
 
         printk("[COMPOSE  ] gen #%d: parent=%.5f kid1=%.5f kid2=%.5f hybrid=%.5f\n",
                gen, (double)m_parent, (double)m_k1, (double)m_k2, (double)m_hyb);
+        printk("[COMPOSE  ]         nonzero: parent=%d kid1=%d kid2=%d hybrid=%d\n",
+               count_nonzero(&snap), count_nonzero(&kids[0]),
+               count_nonzero(&kids[1]), count_nonzero(&hybrid));
 
         struct msg m = { .type = MSG_COMPOSITION_DONE, .iter = (uint32_t)gen,
                          .mse = m_hyb, .heldout_mse = m_hyb };
