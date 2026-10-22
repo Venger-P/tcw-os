@@ -6,23 +6,12 @@
 #include "tcw_ai.h"
 
 /* ============================================================
- * TCW-OS v0.6 — Full TCW-Life with learnable PHI
+ * TCW-OS v0.6.1 — Full TCW-Life (3 fixes over v0.6)
  *
- * PHI = residual MLP (1->8->1, tanh, 25 weights = 100 bytes).
- * y_pred(x) = y_model(x) + PHI(x / 2pi)
- *
- * 7 threads (priority; lower = higher):
- *   repair         (1) : restore PHI from backup
- *   etopo          (2) : SGD train PHI on D_train (metabolism)
- *   aging          (3) : zero smallest-|w| weights, rank-=2
- *   control        (4) : aggregates lifecycle + prints homeostasis
- *   mutation       (5) : random reinit PHI (new environment)
- *   inference      (6) : y_pred, MSE, damage every 5th iter
- *   proliferation  (7) : 3 children with 25% dropout
- *
- * Homeostasis metric: held-out MSE (10 clean points, unseen by etopo)
- * after each operation. Should stay low across R/A/M/P.
- * E_topo is the ONE operation that can drift it (by design — learning).
+ * Fixes:
+ *   1. damage counter: only increments on corrupted=1
+ *   2. etopo starts at 400ms (before first aging at 600ms)
+ *   3. mutation range [-0.5, 0.5] (was [-0.1, 0.1]) — see tcw_runtime.c
  * ============================================================ */
 
 #define STACK_SIZE               4096
@@ -38,7 +27,7 @@
 #define DAMAGE_EVERY_N           5
 #define AGING_EVERY_MS           600
 #define MUTATION_EVERY_MS        1400
-#define ETOPO_EVERY_MS           2500
+#define ETOPO_EVERY_MS           400     /* v0.6.1: was 2500 */
 #define PROLIFERATION_EVERY_MS   3000
 #define AGING_STEP               2
 #define N_CHILDREN               3
@@ -57,7 +46,6 @@ enum msg_type {
     MSG_MUTATION_DONE,
     MSG_PROGENY_DONE,
     MSG_ETOPO_DONE,
-    MSG_HELDOUT,
 };
 
 struct msg {
@@ -66,6 +54,7 @@ struct msg {
     float         mse;
     float         heldout_mse;
     uint16_t      rank;
+    uint8_t       corrupted;   /* v0.6.1: 1 if damage occurred */
 };
 
 K_MSGQ_DEFINE(queue_to_control, sizeof(struct msg), 64, 4);
@@ -74,7 +63,6 @@ K_MUTEX_DEFINE(phi_lock);
 
 static tcw_agent_t agent;
 
-/* === Homeostasis: held-out MSE (10 clean points, always) === */
 static float compute_heldout_mse(void) {
     float sum = 0.0f;
     for (int k = 0; k < 10; k++) {
@@ -117,6 +105,11 @@ static void inference_thread(void *a, void *b, void *c)
             sanitize_phi();
             k_mutex_unlock(&phi_lock);
             printk("[INFERENCE] iter=%d -- PHI CORRUPTED\n", iter);
+
+            struct msg c = { .type = MSG_INFERENCE_RESULT, .iter = iter,
+                             .corrupted = 1 };
+            k_msgq_put(&queue_to_control, &c, K_NO_WAIT);
+
             struct msg r = { .type = MSG_INFERENCE_RESULT, .iter = iter };
             k_msgq_put(&queue_to_repair, &r, K_NO_WAIT);
             k_sleep(K_MSEC(200));
@@ -140,7 +133,7 @@ static void inference_thread(void *a, void *b, void *c)
                iter, (double)x, (double)yp, (double)yt, (double)err, rank);
 
         struct msg m = { .type = MSG_INFERENCE_RESULT, .iter = iter,
-                         .mse = err, .rank = rank };
+                         .mse = err, .rank = rank, .corrupted = 0 };
         k_msgq_put(&queue_to_control, &m, K_NO_WAIT);
         k_sleep(K_MSEC(200));
     }
@@ -148,7 +141,7 @@ static void inference_thread(void *a, void *b, void *c)
     k_sleep(K_SECONDS(2));
 }
 
-/* ================== ETOPO (prio 2): metabolism ================== */
+/* ================== ETOPO (prio 2) ================== */
 static void etopo_thread(void *a, void *b, void *c)
 {
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
@@ -160,8 +153,6 @@ static void etopo_thread(void *a, void *b, void *c)
             return;
         }
 
-        /* D_train: 20 points of sine + tiny high-freq noise.
-         * Target for PHI = y_true(x) - y_model(x). */
         float x_train[ETOPO_BATCH], y_train[ETOPO_BATCH];
         for (int k = 0; k < ETOPO_BATCH; k++) {
             float x = (float)k / (float)ETOPO_BATCH * TWO_PI;
@@ -177,9 +168,9 @@ static void etopo_thread(void *a, void *b, void *c)
         k_mutex_unlock(&phi_lock);
 
         if (s == TCW_OK) {
-            printk("[ETOPO    ] trained %d epochs on %d noisy samples, held-out MSE=%.5f\n",
-                   ETOPO_EPOCHS, ETOPO_BATCH, (double)ho);
-            struct msg m = { .type = MSG_ETOPO_DONE, .iter = 0,
+            printk("[ETOPO    ] trained %d epochs, held-out MSE=%.5f\n",
+                   ETOPO_EPOCHS, (double)ho);
+            struct msg m = { .type = MSG_ETOPO_DONE,
                              .heldout_mse = ho, .rank = agent.phi.rank };
             k_msgq_put(&queue_to_control, &m, K_NO_WAIT);
         }
@@ -331,12 +322,13 @@ static void control_thread(void *a, void *b, void *c)
         k_msgq_get(&queue_to_control, &m, K_FOREVER);
 
         if (m.type == MSG_INFERENCE_RESULT) {
-            if (m.mse > 0.0f && m.mse < 1e3f) {
+            if (m.corrupted) {
+                damages++;
+            } else if (m.mse > 0.0f && m.mse < 1e3f) {
                 mse_sum += m.mse; mse_cnt++;
                 if (m.mse < mse_min) mse_min = m.mse;
                 if (m.mse > mse_max) mse_max = m.mse;
             }
-            damages++;
             continue;
         }
 
@@ -356,7 +348,7 @@ static void control_thread(void *a, void *b, void *c)
                        "agings=%d, mutations=%d, proliferations=%d, etopos=%d\n",
                        damages, repairs, agings, mutations, proliferations, etopos);
                 if (mse_cnt)
-                    printk("[CONTROL  ] infer MSE:   min=%.5f max=%.5f avg=%.5f\n",
+                    printk("[CONTROL  ] infer MSE:    min=%.5f max=%.5f avg=%.5f\n",
                            (double)mse_min, (double)mse_max, (double)(mse_sum/mse_cnt));
                 if (ho_cnt)
                     printk("[CONTROL  ] held-out MSE: min=%.5f max=%.5f avg=%.5f\n",
@@ -388,7 +380,7 @@ int main(void)
 {
     printk("\n");
     printk("==================================================\n");
-    printk("  TCW-OS v0.6: Full TCW-Life (learnable PHI)\n");
+    printk("  TCW-OS v0.6.1: Full TCW-Life (fixes)\n");
     printk("  PHI = residual MLP (1->8->1, tanh, 25 weights)\n");
     printk("  E_topo + R + A + M + P on real TFLite model\n");
     printk("==================================================\n\n");
@@ -396,7 +388,6 @@ int main(void)
     tcw_ai_init();
     printk("TFLite Micro: sine-wave model (INT8), frozen as C (genome)\n");
 
-    /* Genome: initial PHI = zeros (MLP outputs 0, y_pred = y_model) */
     uint8_t genome[TCW_PHI_SIZE_BYTES];
     memset(genome, 0, TCW_PHI_SIZE_BYTES);
 

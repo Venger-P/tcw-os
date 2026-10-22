@@ -168,7 +168,7 @@ tcw_status_t tcw_mutation(tcw_agent_t *agent, uint32_t seed) {
     uint32_t rng = seed ? seed : 42u;
     for (int j = 0; j < TCW_MLP_N_WEIGHTS; j++) {
         int32_t r = (int32_t)xorshift32(&rng);
-        w[j] = ((float)r / 2147483648.0f) * 0.1f;
+        w[j] = ((float)r / 2147483648.0f) * 0.5f;
     }
 
     memcpy(agent->phi.backup, agent->phi.working, TCW_PHI_SIZE_BYTES);
