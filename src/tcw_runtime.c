@@ -48,7 +48,6 @@ tcw_status_t tcw_init(tcw_agent_t *agent,
     agent->genome.size  = genome_size;
     agent->genome.crc32 = tcw_crc32(genome_data, genome_size);
 
-    /* Birth: PHI = zero MLP (y_corr = 0, model used as-is) */
     memset(agent->phi.working, 0, TCW_PHI_SIZE_BYTES);
     memset(agent->phi.backup,  0, TCW_PHI_SIZE_BYTES);
 
@@ -64,9 +63,7 @@ tcw_status_t tcw_init(tcw_agent_t *agent,
 }
 
 /* ============================================================
- * E_topo: metabolism. SGD on PHI, C frozen.
- * Loss: L = 0.5 * (y_pred - y_target)^2
- * Grad: dL/dy = (y_pred - y_target)
+ * E_topo: basic SGD (used for continuous metabolism after ontogeny)
  * ============================================================ */
 tcw_status_t tcw_etopo(tcw_agent_t *agent,
                        const float *x_data, const float *y_target,
@@ -81,7 +78,6 @@ tcw_status_t tcw_etopo(tcw_agent_t *agent,
             float x  = x_data[i];
             float yt = y_target[i];
 
-            /* Forward */
             float z[TCW_MLP_HIDDEN];
             float y = m->b2;
             for (int j = 0; j < TCW_MLP_HIDDEN; j++) {
@@ -89,7 +85,6 @@ tcw_status_t tcw_etopo(tcw_agent_t *agent,
                 y += m->w2[j] * z[j];
             }
 
-            /* Backward */
             float dy = y - yt;
             for (int j = 0; j < TCW_MLP_HIDDEN; j++) {
                 float dz = dy * m->w2[j] * (1.0f - z[j] * z[j]);
@@ -101,9 +96,147 @@ tcw_status_t tcw_etopo(tcw_agent_t *agent,
         }
     }
 
-    /* New knowledge is now the "healthy" state */
     memcpy(agent->phi.backup, agent->phi.working, TCW_PHI_SIZE_BYTES);
     agent->phi.checksum = tcw_crc32(agent->phi.working, TCW_PHI_SIZE_BYTES);
+    return TCW_OK;
+}
+
+/* ============================================================
+ * EWC: elastic weight consolidation.
+ * Penalty: λ * F_j * (w_j - θ_old_j)^2, gradient: λ * F_j * (w_j - θ_old_j)
+ * F_j = mean squared gradient over dataset (Fisher diagonal approx).
+ * ============================================================ */
+tcw_status_t tcw_compute_fisher(const tcw_agent_t *agent,
+                                 const float *x_data, const float *y_target,
+                                 size_t n, float *fisher) {
+    if (!agent || !x_data || !y_target || !fisher || n == 0) return TCW_ERR_INVALID_ARG;
+
+    memset(fisher, 0, sizeof(float) * TCW_MLP_N_WEIGHTS);
+
+    const tcw_mlp_t *m = phi_mlp_const(agent);
+
+    for (size_t i = 0; i < n; i++) {
+        float x  = x_data[i];
+        float yt = y_target[i];
+
+        float z[TCW_MLP_HIDDEN];
+        float y = m->b2;
+        for (int j = 0; j < TCW_MLP_HIDDEN; j++) {
+            z[j] = tanhf(m->w1[j] * x + m->b1[j]);
+            y += m->w2[j] * z[j];
+        }
+        float dy = y - yt;
+
+        int idx = 0;
+        for (int j = 0; j < TCW_MLP_HIDDEN; j++, idx++) {
+            float dz = dy * m->w2[j] * (1.0f - z[j] * z[j]);
+            float g  = dz * x;             /* ∂L/∂w1[j] */
+            fisher[idx] += g * g;
+        }
+        for (int j = 0; j < TCW_MLP_HIDDEN; j++, idx++) {
+            float dz = dy * m->w2[j] * (1.0f - z[j] * z[j]);
+            float g  = dz;                 /* ∂L/∂b1[j] */
+            fisher[idx] += g * g;
+        }
+        for (int j = 0; j < TCW_MLP_HIDDEN; j++, idx++) {
+            float g = dy * z[j];           /* ∂L/∂w2[j] */
+            fisher[idx] += g * g;
+        }
+        fisher[idx] += dy * dy;            /* ∂L/∂b2 */
+    }
+
+    float inv_n = 1.0f / (float)n;
+    for (int j = 0; j < TCW_MLP_N_WEIGHTS; j++) fisher[j] *= inv_n;
+    return TCW_OK;
+}
+
+tcw_status_t tcw_etopo_ewc(tcw_agent_t *agent,
+                            const float *x_data, const float *y_target,
+                            size_t n, float lr, int epochs,
+                            const float *fisher, const float *theta_old,
+                            float lambda) {
+    if (!agent || !x_data || !y_target || !fisher || !theta_old || n == 0)
+        return TCW_ERR_INVALID_ARG;
+    if (!agent->phi.alive) return TCW_ERR_DEAD;
+
+    tcw_mlp_t *m = phi_mlp(agent);
+
+    for (int ep = 0; ep < epochs; ep++) {
+        for (size_t i = 0; i < n; i++) {
+            float x  = x_data[i];
+            float yt = y_target[i];
+
+            float z[TCW_MLP_HIDDEN];
+            float y = m->b2;
+            for (int j = 0; j < TCW_MLP_HIDDEN; j++) {
+                z[j] = tanhf(m->w1[j] * x + m->b1[j]);
+                y += m->w2[j] * z[j];
+            }
+            float dy = y - yt;
+
+            /* Backward with EWC penalty applied per weight */
+            float dw1[TCW_MLP_HIDDEN], db1[TCW_MLP_HIDDEN];
+            float dw2[TCW_MLP_HIDDEN];
+            for (int j = 0; j < TCW_MLP_HIDDEN; j++) {
+                float dz = dy * m->w2[j] * (1.0f - z[j] * z[j]);
+                dw1[j] = dz * x;
+                db1[j] = dz;
+                dw2[j] = dy * z[j];
+            }
+
+            int idx = 0;
+            for (int j = 0; j < TCW_MLP_HIDDEN; j++, idx++) {
+                float ewc = lambda * fisher[idx] * (m->w1[j] - theta_old[idx]);
+                m->w1[j] -= lr * (dw1[j] + ewc);
+            }
+            for (int j = 0; j < TCW_MLP_HIDDEN; j++, idx++) {
+                float ewc = lambda * fisher[idx] * (m->b1[j] - theta_old[idx]);
+                m->b1[j] -= lr * (db1[j] + ewc);
+            }
+            for (int j = 0; j < TCW_MLP_HIDDEN; j++, idx++) {
+                float ewc = lambda * fisher[idx] * (m->w2[j] - theta_old[idx]);
+                m->w2[j] -= lr * (dw2[j] + ewc);
+            }
+            {
+                float ewc = lambda * fisher[idx] * (m->b2 - theta_old[idx]);
+                m->b2 -= lr * (dy + ewc);
+            }
+        }
+    }
+
+    memcpy(agent->phi.backup, agent->phi.working, TCW_PHI_SIZE_BYTES);
+    agent->phi.checksum = tcw_crc32(agent->phi.working, TCW_PHI_SIZE_BYTES);
+    return TCW_OK;
+}
+
+/* ============================================================
+ * Composition (⊕): out = α·A + (1-α)·B (weighted average of weights).
+ * C (genome) inherited from A. Gate inherited from A.
+ * ============================================================ */
+tcw_status_t tcw_composition(tcw_agent_t *out,
+                             const tcw_agent_t *a, const tcw_agent_t *b,
+                             float alpha) {
+    if (!out || !a || !b) return TCW_ERR_INVALID_ARG;
+    if (!a->phi.alive || !b->phi.alive) return TCW_ERR_DEAD;
+    if (alpha < 0.0f) alpha = 0.0f;
+    if (alpha > 1.0f) alpha = 1.0f;
+
+    out->genome = a->genome;
+    out->gate   = a->gate;
+
+    float *w_out = (float *)out->phi.working;
+    const float *w_a = (const float *)a->phi.working;
+    const float *w_b = (const float *)b->phi.working;
+    for (int j = 0; j < TCW_MLP_N_WEIGHTS; j++) {
+        w_out[j] = alpha * w_a[j] + (1.0f - alpha) * w_b[j];
+    }
+    memcpy(out->phi.backup, out->phi.working, TCW_PHI_SIZE_BYTES);
+
+    out->phi.size     = a->phi.size;
+    out->phi.rank     = (a->phi.rank < b->phi.rank) ? a->phi.rank : b->phi.rank;
+    out->phi.max_rank = a->phi.max_rank;
+    out->phi.alive    = true;
+    out->phi.checksum = tcw_crc32(out->phi.working, TCW_PHI_SIZE_BYTES);
     return TCW_OK;
 }
 
@@ -121,11 +254,6 @@ tcw_status_t tcw_repair(tcw_agent_t *agent) {
     return TCW_OK;
 }
 
-/* ============================================================
- * Aging: zero weights with smallest |w|.
- * Number to zero = (1 - rank/max_rank) * N_WEIGHTS (cumulative).
- * After each aging step, backup is synced (irreversible).
- * ============================================================ */
 tcw_status_t tcw_aging(tcw_agent_t *agent, uint16_t delta_rank) {
     if (!agent) return TCW_ERR_INVALID_ARG;
     if (!agent->phi.alive) return TCW_ERR_DEAD;
@@ -140,7 +268,6 @@ tcw_status_t tcw_aging(tcw_agent_t *agent, uint16_t delta_rank) {
     int n_to_zero = (int)(frac_dead * (float)TCW_MLP_N_WEIGHTS);
     if (n_to_zero > TCW_MLP_N_WEIGHTS) n_to_zero = TCW_MLP_N_WEIGHTS;
 
-    /* Iteratively zero the smallest-magnitude non-zero weight */
     for (int k = 0; k < n_to_zero; k++) {
         int min_idx = -1;
         float min_abs = 1e30f;
@@ -159,7 +286,6 @@ tcw_status_t tcw_aging(tcw_agent_t *agent, uint16_t delta_rank) {
     return TCW_OK;
 }
 
-/* Mutation: random reinit of all weights, small uniform [-0.1, 0.1] */
 tcw_status_t tcw_mutation(tcw_agent_t *agent, uint32_t seed) {
     if (!agent) return TCW_ERR_INVALID_ARG;
     if (!agent->phi.alive) return TCW_ERR_DEAD;
@@ -171,12 +297,15 @@ tcw_status_t tcw_mutation(tcw_agent_t *agent, uint32_t seed) {
         w[j] = ((float)r / 2147483648.0f) * 0.5f;
     }
 
+    /* v0.8: mutation also perturbs gate — expression changes */
+    float gr = (float)(xorshift32(&rng) & 0xFFFF) / 65535.0f;
+    agent->gate.alpha = 0.5f + gr;  /* [0.5, 1.5] */
+
     memcpy(agent->phi.backup, agent->phi.working, TCW_PHI_SIZE_BYTES);
     agent->phi.checksum = tcw_crc32(agent->phi.working, TCW_PHI_SIZE_BYTES);
     return TCW_OK;
 }
 
-/* Proliferation: children with per-weight dropout prob p in [0, 1] */
 tcw_status_t tcw_proliferation(const tcw_agent_t *parent,
                                tcw_agent_t *children, size_t n_children,
                                uint32_t seed, float dropout_p) {
@@ -186,7 +315,7 @@ tcw_status_t tcw_proliferation(const tcw_agent_t *parent,
     if (dropout_p > 1.0f) dropout_p = 1.0f;
 
     uint32_t rng = seed ? seed : 12345u;
-    uint32_t thresh = (uint32_t)(dropout_p * 4294967040.0f);  /* avoid UINT32_MAX edge */
+    uint32_t thresh = (uint32_t)(dropout_p * 4294967040.0f);
 
     for (size_t i = 0; i < n_children; i++) {
         children[i].genome = parent->genome;
@@ -197,9 +326,7 @@ tcw_status_t tcw_proliferation(const tcw_agent_t *parent,
 
         float *w = (float *)children[i].phi.working;
         for (int j = 0; j < TCW_MLP_N_WEIGHTS; j++) {
-            if (xorshift32(&rng) < thresh) {
-                w[j] = 0.0f;
-            }
+            if (xorshift32(&rng) < thresh) w[j] = 0.0f;
         }
 
         children[i].phi.size     = parent->phi.size;
@@ -214,7 +341,6 @@ tcw_status_t tcw_proliferation(const tcw_agent_t *parent,
 tcw_status_t tcw_damage(tcw_agent_t *agent, size_t num_bytes, uint32_t seed) {
     if (!agent) return TCW_ERR_INVALID_ARG;
     if (num_bytes > TCW_PHI_SIZE_BYTES) num_bytes = TCW_PHI_SIZE_BYTES;
-
     uint32_t rng = seed ? seed : 42u;
     for (size_t i = 0; i < num_bytes; i++) {
         agent->phi.working[i] ^= (uint8_t)xorshift32(&rng);
