@@ -20,7 +20,7 @@
  *   P (Proliferation) — копия Phi с маской
  * ============================================================ */
 
-#define TCW_PHI_SIZE_BYTES  2048
+#define TCW_PHI_SIZE_BYTES  8
 #define TCW_MAX_CHILDREN    4
 
 typedef enum {
