@@ -6,30 +6,37 @@
 #include "tcw_ai.h"
 
 /* ============================================================
- * TCW-OS v0.4: Living Neural Network (TFLite Micro)
- *   Birth -> Aging -> Mutation -> Damage -> Repair -> Death
+ * TCW-OS v0.5: Full Lifecycle with Proliferation
+ *   Birth -> Aging -> Mutation -> Damage -> Repair
+ *         -> Proliferation -> Death
  *
- * PHI = 8 bytes = two floats (alpha, beta).
- * Inference: y_final = alpha * y_model(x) + beta
- * Metric:    MSE vs sinf(x)
+ * 6 threads (priority; lower number = higher):
+ *   repair         (1) — restores PHI on damage
+ *   aging          (2) — alpha = rank/max_rank every 600ms
+ *   control        (3) — aggregates, prints lifecycle
+ *   mutation       (4) — alpha,beta <- new env every 1400ms
+ *   inference      (5) — damages every 5th iter
+ *   proliferation  (6) — 3 children every 3000ms
  *
- * Damage XORs 8 bytes; sanitize rejects NaN/Inf/|x|>100.
- * Aging:    alpha = rank / max_rank.
- * Mutation: alpha, beta <- new env.
+ * PHI = 8 bytes = (alpha, beta), y = alpha * y_model + beta
+ * Children inherit genome C (model, Read-Only), get own masked PHI.
  * ============================================================ */
 
-#define STACK_SIZE          4096
-#define PRIO_REPAIR         1
-#define PRIO_AGING          2
-#define PRIO_CONTROL        3
-#define PRIO_MUTATION       4
-#define PRIO_INFERENCE      5
+#define STACK_SIZE               4096
+#define PRIO_REPAIR              1
+#define PRIO_AGING               2
+#define PRIO_CONTROL             3
+#define PRIO_MUTATION            4
+#define PRIO_INFERENCE           5
+#define PRIO_PROLIFERATION       6
 
-#define DEMO_ITERATIONS     30
-#define DAMAGE_EVERY_N      5
-#define AGING_EVERY_MS      600
-#define MUTATION_EVERY_MS   1400
-#define AGING_STEP          2
+#define DEMO_ITERATIONS          30
+#define DAMAGE_EVERY_N           5
+#define AGING_EVERY_MS           600
+#define MUTATION_EVERY_MS        1400
+#define PROLIFERATION_EVERY_MS   3000
+#define AGING_STEP               2
+#define N_CHILDREN               3
 
 enum msg_type {
     MSG_INFERENCE_RESULT,
@@ -37,6 +44,7 @@ enum msg_type {
     MSG_REPAIR_FAILED,
     MSG_AGING_DONE,
     MSG_MUTATION_DONE,
+    MSG_PROGENY_DONE,
 };
 
 struct msg {
@@ -48,13 +56,13 @@ struct msg {
     uint16_t      rank;
 };
 
-K_MSGQ_DEFINE(queue_to_control, sizeof(struct msg), 32, 4);
+K_MSGQ_DEFINE(queue_to_control, sizeof(struct msg), 64, 4);
 K_MSGQ_DEFINE(queue_to_repair,  sizeof(struct msg), 8,  4);
 K_MUTEX_DEFINE(phi_lock);
 
 static tcw_agent_t agent;
 
-/* ------- calibration helpers (read/write PHI as two floats) ------- */
+/* ------- calibration helpers ------- */
 static void read_calib(float *a, float *b) {
     memcpy(a, agent.phi.working,     4);
     memcpy(b, agent.phi.working + 4, 4);
@@ -64,7 +72,6 @@ static void write_calib(float a, float b) {
     memcpy(agent.phi.working + 4, &b, 4);
 }
 
-/* Reject NaN, Inf, AND unreasonably large values */
 static void sanitize_calib(void) {
     float a, b;
     read_calib(&a, &b);
@@ -73,7 +80,6 @@ static void sanitize_calib(void) {
     }
 }
 
-/* Semantic aging: alpha = rank / max_rank, backup synced */
 static tcw_status_t aging_calib(tcw_agent_t *ag, uint16_t delta) {
     if (!ag || !ag->phi.alive) return TCW_ERR_DEAD;
 
@@ -85,7 +91,6 @@ static tcw_status_t aging_calib(tcw_agent_t *ag, uint16_t delta) {
     float a = (float)nw / (float)ag->phi.max_rank;
     float b;
     memcpy(&b, ag->phi.working + 4, 4);
-
     write_calib(a, b);
     memcpy(ag->phi.backup, ag->phi.working, TCW_PHI_SIZE_BYTES);
     ag->phi.checksum = tcw_crc32(ag->phi.working, TCW_PHI_SIZE_BYTES);
@@ -127,6 +132,7 @@ static void inference_thread(void *a, void *b, void *c)
         float y_model = tcw_ai_infer_raw(x);
         float alpha, beta;
         read_calib(&alpha, &beta);
+        uint16_t rank = agent.phi.rank;
         k_mutex_unlock(&phi_lock);
 
         float y_pred = alpha * y_model + beta;
@@ -135,13 +141,11 @@ static void inference_thread(void *a, void *b, void *c)
 
         printk("[INFERENCE] iter=%d x=%.2f y_pred=%.3f y_true=%.3f err=%.4f a=%.2f b=%.2f rank=%u\n",
                iter, (double)x, (double)y_pred, (double)y_true,
-               (double)err, (double)alpha, (double)beta, agent.phi.rank);
+               (double)err, (double)alpha, (double)beta, rank);
 
         struct msg m = {
-            .type = MSG_INFERENCE_RESULT,
-            .iter = iter,
-            .alpha = alpha, .beta = beta,
-            .mse = err, .rank = agent.phi.rank,
+            .type = MSG_INFERENCE_RESULT, .iter = iter,
+            .alpha = alpha, .beta = beta, .mse = err, .rank = rank,
         };
         k_msgq_put(&queue_to_control, &m, K_NO_WAIT);
         k_sleep(K_MSEC(200));
@@ -203,8 +207,8 @@ static void aging_thread(void *a, void *b, void *c)
             printk("[AGING    ] rank->%u a=%.3f%s\n",
                    rank, (double)alpha, alive ? "" : "  *** DEAD ***");
             struct msg m = {
-                .type = MSG_AGING_DONE,
-                .iter = 0, .alpha = alpha, .beta = beta, .rank = rank,
+                .type = MSG_AGING_DONE, .iter = 0,
+                .alpha = alpha, .beta = beta, .rank = rank,
             };
             k_msgq_put(&queue_to_control, &m, K_NO_WAIT);
             if (!alive) return;
@@ -247,13 +251,89 @@ static void mutation_thread(void *a, void *b, void *c)
     }
 }
 
+/* ================== PROLIFERATION (prio 6) ==================
+ * Creates N_CHILDREN copies of current PHI with dropout mask (5%).
+ * Each child shares genome C (the TFLite model, Read-Only).
+ * Children are short-lived snapshots — we evaluate them and discard.
+ * Demonstrates operation P: spawning with variation. */
+static void proliferation_thread(void *a, void *b, void *c)
+{
+    ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+
+    static tcw_agent_t children[N_CHILDREN];
+    int generation = 0;
+
+    while (1) {
+        k_sleep(K_MSEC(PROLIFERATION_EVERY_MS));
+        if (!agent.phi.alive) {
+            printk("[PROLIF   ] parent dead, stopping\n");
+            return;
+        }
+
+        /* Snapshot parent under lock */
+        k_mutex_lock(&phi_lock, K_FOREVER);
+        tcw_agent_t parent_snapshot = agent;
+        k_mutex_unlock(&phi_lock);
+
+        tcw_status_t s = tcw_proliferation(&parent_snapshot, children, N_CHILDREN,
+                                            (uint32_t)(generation + 1));
+        if (s != TCW_OK) continue;
+        generation++;
+
+        /* Evaluate each child on 10 points */
+        printk("[PROLIF   ] gen #%d: spawned %d children\n",
+               generation, N_CHILDREN);
+
+        float parent_mse = 0.0f;
+        for (int k = 0; k < 10; k++) {
+            float x = (float)k / 10.0f * 2.0f * 3.14159265f;
+            float ym = tcw_ai_infer_raw(x);
+            float pa, pb;
+            memcpy(&pa, parent_snapshot.phi.working, 4);
+            memcpy(&pb, parent_snapshot.phi.working + 4, 4);
+            float yp = pa * ym + pb;
+            float e = yp - sinf(x);
+            parent_mse += e * e;
+        }
+        parent_mse /= 10.0f;
+        printk("[PROLIF   ]   parent: MSE=%.4f rank=%u\n",
+               (double)parent_mse, parent_snapshot.phi.rank);
+
+        for (int i = 0; i < N_CHILDREN; i++) {
+            float ca, cb;
+            memcpy(&ca, children[i].phi.working, 4);
+            memcpy(&cb, children[i].phi.working + 4, 4);
+
+            float mse = 0.0f;
+            for (int k = 0; k < 10; k++) {
+                float x = (float)k / 10.0f * 2.0f * 3.14159265f;
+                float ym = tcw_ai_infer_raw(x);
+                float yp = ca * ym + cb;
+                float e = yp - sinf(x);
+                mse += e * e;
+            }
+            mse /= 10.0f;
+
+            printk("[PROLIF   ]   child#%d: a=%.2f b=%.2f rank=%u MSE=%.4f\n",
+                   i + 1, (double)ca, (double)cb,
+                   children[i].phi.rank, (double)mse);
+        }
+
+        struct msg m = {
+            .type = MSG_PROGENY_DONE, .iter = (uint32_t)generation,
+            .rank = parent_snapshot.phi.rank,
+        };
+        k_msgq_put(&queue_to_control, &m, K_NO_WAIT);
+    }
+}
+
 /* ================== CONTROL (prio 3) ================== */
 static void control_thread(void *a, void *b, void *c)
 {
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 
     int damages = 0, repairs_ok = 0, repairs_failed = 0;
-    int agings = 0, mutations = 0;
+    int agings = 0, mutations = 0, proliferations = 0;
     float mse_sum = 0.0f;
     int mse_cnt = 0;
     float mse_min = 1e9f, mse_max = 0.0f;
@@ -278,8 +358,9 @@ static void control_thread(void *a, void *b, void *c)
             if (m.rank == 0) {
                 printk("\n[CONTROL  ] *** AGENT DIED OF OLD AGE (rank=0, a=0) ***\n");
                 printk("[CONTROL  ] LIFECYCLE: damages=%d, repairs_ok=%d, "
-                       "repairs_failed=%d, agings=%d, mutations=%d\n",
-                       damages, repairs_ok, repairs_failed, agings, mutations);
+                       "repairs_failed=%d, agings=%d, mutations=%d, proliferations=%d\n",
+                       damages, repairs_ok, repairs_failed,
+                       agings, mutations, proliferations);
                 if (mse_cnt > 0) {
                     printk("[CONTROL  ] MSE: min=%.4f max=%.4f avg=%.4f\n\n",
                            (double)mse_min, (double)mse_max,
@@ -288,27 +369,33 @@ static void control_thread(void *a, void *b, void *c)
             }
             break;
         case MSG_MUTATION_DONE: mutations++; break;
+        case MSG_PROGENY_DONE:
+            proliferations++;
+            printk("[CONTROL  ] PROGENY #%u confirmed\n", m.iter);
+            break;
         default: break;
         }
     }
 }
 
 /* ================== STACKS & TCBs ================== */
-K_THREAD_STACK_DEFINE(inference_stack, STACK_SIZE);
-K_THREAD_STACK_DEFINE(repair_stack,    STACK_SIZE);
-K_THREAD_STACK_DEFINE(aging_stack,     STACK_SIZE);
-K_THREAD_STACK_DEFINE(mutation_stack,  STACK_SIZE);
-K_THREAD_STACK_DEFINE(control_stack,   STACK_SIZE);
+K_THREAD_STACK_DEFINE(inference_stack,     STACK_SIZE);
+K_THREAD_STACK_DEFINE(repair_stack,        STACK_SIZE);
+K_THREAD_STACK_DEFINE(aging_stack,         STACK_SIZE);
+K_THREAD_STACK_DEFINE(mutation_stack,      STACK_SIZE);
+K_THREAD_STACK_DEFINE(proliferation_stack, STACK_SIZE);
+K_THREAD_STACK_DEFINE(control_stack,       STACK_SIZE);
 
-static struct k_thread inference_tcb, repair_tcb, aging_tcb, mutation_tcb, control_tcb;
+static struct k_thread inference_tcb, repair_tcb, aging_tcb,
+                      mutation_tcb, proliferation_tcb, control_tcb;
 
 /* ================== ENTRY ================== */
 int main(void)
 {
     printk("\n");
     printk("==================================================\n");
-    printk("  TCW-OS v0.4: Living Neural Network (TFLite Micro)\n");
-    printk("  PHI = (alpha, beta), y = alpha * y_model + beta\n");
+    printk("  TCW-OS v0.5: Full Lifecycle with Proliferation\n");
+    printk("  R + A + M + P on real TFLite model (INT8)\n");
     printk("==================================================\n\n");
 
     tcw_ai_init();
@@ -343,6 +430,10 @@ int main(void)
     k_thread_create(&inference_tcb, inference_stack, STACK_SIZE,
                     inference_thread, NULL, NULL, NULL, PRIO_INFERENCE, 0, K_NO_WAIT);
     k_thread_name_set(&inference_tcb, "tcw_inference");
+
+    k_thread_create(&proliferation_tcb, proliferation_stack, STACK_SIZE,
+                    proliferation_thread, NULL, NULL, NULL, PRIO_PROLIFERATION, 0, K_NO_WAIT);
+    k_thread_name_set(&proliferation_tcb, "tcw_prolif");
 
     return 0;
 }
