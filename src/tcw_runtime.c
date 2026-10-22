@@ -1,6 +1,16 @@
 #include "tcw_runtime.h"
 #include <string.h>
 
+/* ============================================================
+ * TCW-Runtime v0.3
+ *
+ * v0.3 fix vs v0.2:
+ *   tcw_aging() now syncs backup with working after aging.
+ *   Rationale (biology): a 40-year-old heals in a 40-year-old body,
+ *   not in a 20-year-old one. Without this fix, repair would "youthify"
+ *   the agent by restoring pre-aged backup, cancelling aging entirely.
+ * ============================================================ */
+
 static uint32_t xorshift32(uint32_t *state) {
     uint32_t x = *state;
     x ^= x << 13;
@@ -72,9 +82,15 @@ tcw_status_t tcw_aging(tcw_agent_t *agent, uint16_t delta_rank) {
     size_t bytes_to_zero = ((size_t)TCW_PHI_SIZE_BYTES * lost) / agent->phi.max_rank;
     if (bytes_to_zero > TCW_PHI_SIZE_BYTES) bytes_to_zero = TCW_PHI_SIZE_BYTES;
 
+    /* Aging: zero out "high-rank" bytes (simulates lost knowledge) */
     memset(&agent->phi.working[TCW_PHI_SIZE_BYTES - bytes_to_zero], 0, bytes_to_zero);
+
     agent->phi.rank = new_rank;
     if (new_rank == 0) agent->phi.alive = false;
+
+    /* v0.3 FIX: sync backup with working, so repair restores AGED state,
+       not the youthful one. Aging becomes irreversible — as in biology. */
+    memcpy(agent->phi.backup, agent->phi.working, TCW_PHI_SIZE_BYTES);
 
     agent->phi.checksum = tcw_crc32(agent->phi.working, TCW_PHI_SIZE_BYTES);
     return TCW_OK;
@@ -106,7 +122,6 @@ tcw_status_t tcw_proliferation(const tcw_agent_t *parent,
         children[i].gate   = parent->gate;
 
         memcpy(children[i].phi.working, parent->phi.working, TCW_PHI_SIZE_BYTES);
-        /* Применяем dropout-маску: ~3% весов зануляются */
         for (size_t j = 0; j < TCW_PHI_SIZE_BYTES; j++) {
             if ((xorshift32(&rng) & 0x1Fu) == 0) {
                 children[i].phi.working[j] = 0;
