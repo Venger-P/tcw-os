@@ -33,7 +33,7 @@ typedef struct {
 } tcw_phi_t;
 
 typedef struct {
-    float alpha;         /* b: gate/expression regulator, multiplies PHI output */
+    float alpha;
     float mutation_rate;
 } tcw_gate_t;
 
@@ -59,27 +59,26 @@ tcw_status_t tcw_init(tcw_agent_t *agent,
                       const uint8_t *genome_data, size_t genome_size,
                       uint16_t max_rank);
 
-/* E_topo: basic SGD on PHI, C frozen */
 tcw_status_t tcw_etopo(tcw_agent_t *agent,
                        const float *x_data, const float *y_target,
                        size_t n, float lr, int epochs);
 
-/* E_topo + EWC: adds penalty λ·F_j·(w_j - θ_old_j) */
 tcw_status_t tcw_etopo_ewc(tcw_agent_t *agent,
                             const float *x_data, const float *y_target,
                             size_t n, float lr, int epochs,
                             const float *fisher, const float *theta_old,
                             float lambda);
 
-/* Fisher diagonal: F_j = E[(∂L/∂w_j)^2] over given data */
 tcw_status_t tcw_compute_fisher(const tcw_agent_t *agent,
                                  const float *x_data, const float *y_target,
                                  size_t n, float *fisher);
 
-/* Composition (⊕): out = α·A + (1-α)·B (weighted weight average) */
 tcw_status_t tcw_composition(tcw_agent_t *out,
                              const tcw_agent_t *a, const tcw_agent_t *b,
                              float alpha);
+
+/* v0.9: N (Normalization) — scale all PHI weights by alpha, no rank change */
+tcw_status_t tcw_normalization(tcw_agent_t *agent, float alpha);
 
 tcw_status_t tcw_repair(tcw_agent_t *agent);
 tcw_status_t tcw_aging(tcw_agent_t *agent, uint16_t delta_rank);

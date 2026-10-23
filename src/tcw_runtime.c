@@ -48,8 +48,16 @@ tcw_status_t tcw_init(tcw_agent_t *agent,
     agent->genome.size  = genome_size;
     agent->genome.crc32 = tcw_crc32(genome_data, genome_size);
 
-    memset(agent->phi.working, 0, TCW_PHI_SIZE_BYTES);
-    memset(agent->phi.backup,  0, TCW_PHI_SIZE_BYTES);
+    /* Birth: PHI = small random MLP (symmetry breaking).
+     * v0.9.2 fix: zero-init causes dead gradient (w2=0 blocks dz),
+     * only b2 learns. Random init [-0.1, 0.1] fixes this. */
+    float *w = (float *)agent->phi.working;
+    uint32_t rng = 0xDEADBEEF;
+    for (int j = 0; j < TCW_MLP_N_WEIGHTS; j++) {
+        int32_t r = (int32_t)xorshift32(&rng);
+        w[j] = ((float)r / 2147483648.0f) * 0.1f;
+    }
+    memcpy(agent->phi.backup, agent->phi.working, TCW_PHI_SIZE_BYTES);
 
     agent->phi.size     = TCW_PHI_SIZE_BYTES;
     agent->phi.rank     = max_rank;
@@ -345,5 +353,26 @@ tcw_status_t tcw_damage(tcw_agent_t *agent, size_t num_bytes, uint32_t seed) {
     for (size_t i = 0; i < num_bytes; i++) {
         agent->phi.working[i] ^= (uint8_t)xorshift32(&rng);
     }
+    return TCW_OK;
+}
+
+/* ============================================================
+ * v0.9: N (Normalization) — 8th operation
+ * Φ' = α · Φ. All weights scaled, rank preserved.
+ * Distinct from aging: aging zeros smallest weights (reduces rank),
+ * normalization scales all weights (keeps rank).
+ * ============================================================ */
+tcw_status_t tcw_normalization(tcw_agent_t *agent, float alpha) {
+    if (!agent) return TCW_ERR_INVALID_ARG;
+    if (!agent->phi.alive) return TCW_ERR_DEAD;
+    if (alpha < 0.0f) alpha = 0.0f;
+
+    float *w = (float *)agent->phi.working;
+    for (int j = 0; j < TCW_MLP_N_WEIGHTS; j++) {
+        w[j] *= alpha;
+    }
+
+    memcpy(agent->phi.backup, agent->phi.working, TCW_PHI_SIZE_BYTES);
+    agent->phi.checksum = tcw_crc32(agent->phi.working, TCW_PHI_SIZE_BYTES);
     return TCW_OK;
 }
