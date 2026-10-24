@@ -6,12 +6,14 @@ build-*/
 # IDE
 .vscode/
 .idea/
+*.swp
 
 # Object files
 *.o
 *.obj
 *.elf
 *.bin
+*.hex
 
 # Zephyr generated
 zephyr/
